@@ -131,6 +131,7 @@ dependencies = [
  "harbour-core",
  "harbour-strategy-local",
  "http",
+ "serde_json",
  "tokio",
  "tower",
 ]

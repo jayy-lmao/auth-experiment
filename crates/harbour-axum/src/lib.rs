@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use axum::{
+    body::to_bytes,
     extract::{FromRequestParts, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::Next,
@@ -7,6 +8,10 @@ use axum::{
 };
 use harbour_core::{AuthContext, Authenticator, Principal, Strategy};
 use std::{convert::Infallible, sync::Arc};
+
+/// Maximum body size read by the auth middleware (64 KB).
+/// Credential payloads are tiny; this prevents memory exhaustion from oversized requests.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 type UnauthorizedResponder = Arc<dyn Fn() -> Response + Send + Sync>;
 
@@ -62,11 +67,18 @@ impl HarbourAuth {
 
     pub async fn middleware_with_strategy(
         &self,
-        mut req: axum::extract::Request,
+        req: axum::extract::Request,
         next: Next,
         strategy_name: Option<&str>,
     ) -> Response {
-        let context = context_from_headers(req.headers());
+        let (mut parts, body) = req.into_parts();
+
+        let bytes = match to_bytes(body, MAX_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => return (self.unauthorized_responder)(),
+        };
+
+        let context = context_from_request(&parts.headers, &bytes);
         let strategy_name = strategy_name.unwrap_or(self.default_strategy.as_str());
 
         match self
@@ -75,7 +87,9 @@ impl HarbourAuth {
             .await
         {
             Ok(principal) => {
-                req.extensions_mut().insert(principal);
+                parts.extensions.insert(principal);
+                let req =
+                    axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
                 next.run(req).await
             }
             Err(_) => (self.unauthorized_responder)(),
@@ -83,7 +97,12 @@ impl HarbourAuth {
     }
 }
 
-pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
+/// Build an [`AuthContext`] from request headers and a buffered body.
+///
+/// - `Authorization: Bearer <token>` → `bearer_token`
+/// - JSON body fields `username` and `password` → `local.identifier` / `local.password`
+///   (aligns with the PassportJS Local Strategy field naming convention)
+pub fn context_from_request(headers: &HeaderMap, body: &[u8]) -> AuthContext {
     let mut context = AuthContext::new();
 
     if let Some(token) = headers
@@ -94,15 +113,17 @@ pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
         context = context.with_field("bearer_token", token);
     }
 
-    if let Some(identifier) = headers
-        .get("x-auth-identifier")
-        .and_then(|v| v.to_str().ok())
-    {
-        context = context.with_field("local.identifier", identifier);
-    }
-
-    if let Some(password) = headers.get("x-auth-password").and_then(|v| v.to_str().ok()) {
-        context = context.with_field("local.password", password);
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(username) = json.get("username").and_then(|v| v.as_str()) {
+            context = context.with_field("local.identifier", username);
+        }
+        if let Some(password) = json.get("password").and_then(|v| v.as_str()) {
+            context = context.with_field("local.password", password);
+        }
+        // If the body is not JSON, or the fields are missing/wrong type, the
+        // local.identifier / local.password keys are simply absent from the context.
+        // LocalStrategy will then return AuthError::MissingCredentials → 401, which
+        // is the correct client-visible outcome.
     }
 
     context

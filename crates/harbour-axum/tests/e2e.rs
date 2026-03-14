@@ -4,7 +4,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal};
@@ -61,7 +61,7 @@ fn protected_app() -> Router {
 
     let local = Router::new().route(
         "/login-local",
-        get(local_handler).route_layer(middleware::from_fn_with_state(
+        post(local_handler).route_layer(middleware::from_fn_with_state(
             auth.clone(),
             |State(auth): State<HarbourAuth>, req, next| async move {
                 auth.middleware_with_strategy(req, next, Some("local"))
@@ -296,14 +296,14 @@ async fn unknown_route_strategy_returns_401() {
 }
 
 #[tokio::test]
-async fn local_strategy_authenticates_from_headers() {
+async fn local_strategy_authenticates_from_json_body() {
     let response = protected_app()
         .oneshot(
             Request::builder()
+                .method("POST")
                 .uri("/login-local")
-                .header("x-auth-identifier", "alice")
-                .header("x-auth-password", "password123")
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"alice","password":"password123"}"#))
                 .unwrap(),
         )
         .await
@@ -319,10 +319,10 @@ async fn local_strategy_rejects_bad_password() {
     let response = protected_app()
         .oneshot(
             Request::builder()
+                .method("POST")
                 .uri("/login-local")
-                .header("x-auth-identifier", "alice")
-                .header("x-auth-password", "wrong")
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"alice","password":"wrong"}"#))
                 .unwrap(),
         )
         .await

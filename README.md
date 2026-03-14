@@ -27,23 +27,24 @@ This repository contains the smallest useful slice of that vision:
 - use `MaybeAuthPrincipal` for endpoints that can be anonymous
 - choose route-level strategy by applying route-level middleware that calls `middleware_with_strategy`
 - optionally customize failed-auth response with `with_unauthorized_response`
-- adapter currently maps headers into context keys:
-  - `Authorization: Bearer ...` -> `bearer_token`
-  - `x-auth-identifier` -> `local.identifier`
-  - `x-auth-password` -> `local.password`
+- adapter maps request data into context keys:
+  - `Authorization: Bearer <token>` → `bearer_token`
+  - JSON body field `username` → `local.identifier`
+  - JSON body field `password` → `local.password`
 
 ## Comparison with PassportJS Local Strategy
 
-### Is the `x-auth-identifier` / `x-auth-password` pattern the same as PassportJS Local?
+### How does Harbour's local strategy align with PassportJS Local?
 
-No. PassportJS Local Strategy (`passport-local`) reads credentials from the **request body** — typically form fields or a JSON body — using field names `username` and `password` (both configurable). It does **not** use custom HTTP headers.
+Harbour's Axum adapter now reads local credentials from the **JSON request body** using the field names `username` and `password` — the same defaults as PassportJS Local Strategy (`passport-local`). The login endpoint is a `POST` route, matching the conventional PassportJS pattern.
 
-Harbour's Axum adapter maps `x-auth-identifier` and `x-auth-password` **request headers** into the auth context, then passes them into the `LocalStrategy`. The credential transport mechanism is therefore different. The term "identifier" is also used instead of "username" to signal that it can be an email, phone number, or any unique handle, not just a traditional username.
+The term "identifier" is used internally (rather than "username") to signal that it can be an email, phone number, or any unique handle, not just a traditional username. This is a naming detail that is invisible to the HTTP client.
 
 ### Similarities in usage / behaviour / developer experience
 
 | Aspect | PassportJS Local | Harbour LocalStrategy |
 |---|---|---|
+| Credential transport | POST request **body** (`username`/`password` JSON fields) | POST request **body** (`username`/`password` JSON fields) |
 | Credential model | identifier + password (configurable field names) | identifier + password |
 | Per-route strategy selection | `passport.authenticate('local')` as middleware | `middleware_with_strategy(req, next, Some("local"))` |
 | Optional (anonymous-friendly) routes | `passport.authenticate('local', { session: false })` without failing | `MaybeAuthPrincipal` extractor |
@@ -51,19 +52,16 @@ Harbour's Axum adapter maps `x-auth-identifier` and `x-auth-password` **request 
 | Multiple strategies registered | `passport.use('admin', new LocalStrategy(...))` | `.with_strategy("admin", LocalStrategy::new(...))` |
 | Invalid credentials → 401 | `done(null, false)` in verify callback | `Err(AuthError::InvalidCredentials)` |
 
-### Differences in usage / behaviour / developer experience
+### Remaining differences in usage / behaviour / developer experience
 
 | Aspect | PassportJS Local | Harbour LocalStrategy |
 |---|---|---|
-| **Credential transport** | Request **body** (form or JSON fields) | Custom **request headers** (`x-auth-identifier`, `x-auth-password`) |
-| **Session management** | Built-in session serialisation/deserialisation; issues a session cookie after successful login by default | No session layer in this MVP; every request must supply credentials in headers |
+| **Session management** | Built-in session serialisation/deserialisation; issues a session cookie after successful login by default | No session layer in this MVP; every request is independently authenticated |
 | **Post-auth flow** | `req.user` populated; session persists across requests | `AuthPrincipal` extractor available only within that request; no persistence |
 | **Extensibility model** | Single verify callback `(username, password, done)` | Separate `LocalUserStore` trait (lookup) + `PasswordVerifier` trait (hashing), each independently swappable |
 | **Framework coupling** | Tightly tied to Express/Connect middleware chain | Framework-agnostic core; Axum is just one adapter |
 | **Error surfacing** | Errors passed to `done(err)` bubble through Express error middleware | Typed `AuthError` enum; strategies return `Result<Principal, AuthError>` |
 | **Custom 401 body** | Requires custom `failWithError` option or a custom callback | First-class `with_unauthorized_response` builder method |
-
-The most consequential behavioral difference for client developers is credential transport: a PassportJS local auth endpoint expects a `POST` with a body (`application/json` or `application/x-www-form-urlencoded`), while Harbour's current Axum adapter expects headers on any HTTP method. A production Harbour adapter would likely want to support body-field extraction as an alternative or preferred transport to align more closely with conventional login endpoints.
 
 ## Why this structure
 

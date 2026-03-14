@@ -9,6 +9,7 @@ harbour-core = { path = "../harbour-core" }
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
+serde_json.workspace = true
 tower.workspace = true
 
 [dev-dependencies]
