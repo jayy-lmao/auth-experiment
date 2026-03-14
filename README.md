@@ -24,6 +24,71 @@ This repository contains the smallest useful slice of that vision:
   - supports HS256 (shared secret) and RS256 (RSA key pair) algorithms
   - pairs with `JwtIssuer` for token generation in login handlers
 
+## Quick Start
+
+The most common production setup is **local password login that issues a JWT**, with subsequent requests authenticated by that JWT. The example below sets this up in one block.
+
+```toml
+# Cargo.toml
+harbour-axum             = { path = "..." }
+harbour-strategy-local   = { path = "...", features = ["argon2"] }
+harbour-strategy-jwt     = { path = "..." }
+```
+
+```rust
+use std::sync::Arc;
+use axum::http::HeaderValue;
+use harbour_axum::HarbourAuth;
+use harbour_core::Principal;
+use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+use harbour_strategy_local::{
+    Argon2PasswordHasher, Argon2PasswordVerifier, InMemoryUserStore, LocalStrategy,
+};
+
+let secret = b"change-me-in-production";
+let issuer = Arc::new(JwtIssuer::hs256(secret, 3600 /* 1 hour */));
+let issuer_hook = Arc::clone(&issuer);
+
+// Swap InMemoryUserStore for a DB-backed LocalUserStore implementation in production.
+let store = InMemoryUserStore::new().with_user(
+    "alice@example.com",
+    Principal::new("user-1").with_name("Alice").with_role("admin"),
+    Argon2PasswordHasher::hash_password("hunter2")?,
+);
+
+let auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_strategy("jwt", JwtStrategy::hs256(secret))
+    // After every successful local login, attach a signed JWT to the response.
+    .with_on_authenticated(move |principal, response| {
+        if let Ok(token) = issuer_hook.issue(principal) {
+            let (mut parts, body) = response.into_parts();
+            if let Ok(val) = HeaderValue::from_str(&token) {
+                parts.headers.insert("x-auth-token", val);
+            }
+            axum::response::Response::from_parts(parts, body)
+        } else {
+            response
+        }
+    });
+```
+
+- **`POST /login`** — apply `require_auth` with `"local"` as the active strategy. On success the hook attaches the JWT in `x-auth-token`.
+- **Protected routes** — apply `require_auth` with `"jwt"` as the active strategy (or set it as the default on `auth`).
+- String strategy names (`"local"`, `"jwt"`) are fine for small/single-file setups. For larger codebases a type-safe enum is preferred — see the [JWT strategy section](#jwt-strategy) below.
+
+### RS256 variant (asymmetric key pair)
+
+```rust
+// Load PEM files from disk (or environment / secrets manager).
+let private_pem = std::fs::read("private.pem")?;
+let public_pem  = std::fs::read("public.pem")?;
+
+let issuer   = JwtIssuer::rs256(&private_pem, 3600)?;  // signing key (login service only)
+let strategy = JwtStrategy::rs256(&public_pem)?;        // verification key (any service)
+```
+
+---
+
 ## Axum usage shape
 
 - create `HarbourAuth` with a default strategy name and strategy implementation
