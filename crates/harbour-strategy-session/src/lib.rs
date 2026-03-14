@@ -237,7 +237,6 @@ impl Strategy for SessionCookieStrategy {
 mod tests {
     use super::*;
     use harbour_core::Authenticator;
-    use harbour_strategy_jwt::JwtIssuer;
 
     #[tokio::test]
     async fn session_strategy_authenticates_valid_cookie() {
@@ -372,20 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn jwt_access_token_is_rejected_as_refresh_token() {
-        // A JWT issued by JwtIssuer (access token) should be usable as a session token
-        // since session cookies encode access tokens. This test verifies the underlying
-        // JWT verification doesn't reject valid tokens.
-        let secret = b"secret";
-        let jwt_issuer = JwtIssuer::hs256(secret);
-        let principal = Principal::new("user-1");
-        let token = jwt_issuer.issue(&principal).unwrap();
-
-        // Direct decode validation: this should work via JwtStrategy
-        let strategy = SessionCookieStrategy::hs256(secret);
-        // We test this path in the async test above, but confirm strategy_name here.
+    fn strategy_name_and_default_cookie_name_are_correct() {
+        let strategy = SessionCookieStrategy::hs256(b"secret");
         assert_eq!(strategy.strategy_name(), "session");
         assert_eq!(strategy.cookie_name(), DEFAULT_SESSION_COOKIE_NAME);
-        drop(token);
     }
 }
