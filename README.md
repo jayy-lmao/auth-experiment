@@ -56,8 +56,8 @@ The term "identifier" is used internally (rather than "username") to signal that
 
 | Aspect | PassportJS Local | Harbour LocalStrategy |
 |---|---|---|
-| **Session management** | Built-in session serialisation/deserialisation; issues a session cookie after successful login by default | No session layer in this MVP; every request is independently authenticated |
-| **Post-auth flow** | `req.user` populated; session persists across requests | `AuthPrincipal` extractor available only within that request; no persistence |
+| **Session management** | Sessions on by default (call `passport.authenticate('local', { session: false })` to disable); built-in serialisation/deserialisation for cookie-backed flows | No session layer; every request is independently authenticated — idiomatic for token-based (JWT) APIs |
+| **Post-auth flow** | `req.user` populated for the request; persists across requests when sessions are enabled, request-scoped only when `session: false` | `AuthPrincipal` extractor available only within that request; no persistence |
 | **Extensibility model** | Single verify callback `(username, password, done)` | Separate `LocalUserStore` trait (lookup) + `PasswordVerifier` trait (hashing), each independently swappable |
 | **Framework coupling** | Tightly tied to Express/Connect middleware chain | Framework-agnostic core; Axum is just one adapter |
 | **Error surfacing** | Errors passed to `done(err)` bubble through Express error middleware | Typed `AuthError` enum; strategies return `Result<Principal, AuthError>` |
