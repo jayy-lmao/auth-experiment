@@ -57,6 +57,10 @@ where
     S: LocalUserStore,
     V: PasswordVerifier,
 {
+    fn strategy_name(&self) -> &str {
+        "local"
+    }
+
     async fn authenticate(&self, context: &AuthContext) -> Result<Principal, AuthError> {
         let identifier = context
             .get(IDENTIFIER_KEY)
@@ -199,7 +203,7 @@ mod tests {
         );
         let strategy = LocalStrategy::new(store, PlaintextPasswordVerifier);
 
-        let auth = Authenticator::new().with_strategy("local", strategy);
+        let auth = Authenticator::new().with_strategy(strategy);
         let context = AuthContext::new()
             .with_field(IDENTIFIER_KEY, "alice")
             .with_field(PASSWORD_KEY, "secret");
@@ -213,7 +217,7 @@ mod tests {
         let store = InMemoryUserStore::new();
         let strategy = LocalStrategy::new(store, PlaintextPasswordVerifier);
 
-        let auth = Authenticator::new().with_strategy("local", strategy);
+        let auth = Authenticator::new().with_strategy(strategy);
         let context = AuthContext::new()
             .with_field(IDENTIFIER_KEY, "bob")
             .with_field(PASSWORD_KEY, "secret");
@@ -231,7 +235,7 @@ mod tests {
         );
         let strategy = LocalStrategy::new(store, PrefixVerifier);
 
-        let auth = Authenticator::new().with_strategy("local", strategy);
+        let auth = Authenticator::new().with_strategy(strategy);
         let context = AuthContext::new()
             .with_field(IDENTIFIER_KEY, "alice")
             .with_field(PASSWORD_KEY, "secret");
@@ -273,7 +277,7 @@ mod tests {
         );
         let strategy = LocalStrategy::new(store, Argon2PasswordVerifier);
 
-        let auth = Authenticator::new().with_strategy("local", strategy);
+        let auth = Authenticator::new().with_strategy(strategy);
         let context = AuthContext::new()
             .with_field(IDENTIFIER_KEY, "bob")
             .with_field(PASSWORD_KEY, "s3cur3pass");

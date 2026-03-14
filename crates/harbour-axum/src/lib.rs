@@ -59,9 +59,21 @@ impl Clone for HarbourAuth {
 }
 
 impl HarbourAuth {
-    pub fn new(default_strategy: impl StrategyName, strategy: impl Strategy + 'static) -> Self {
-        let default_strategy = default_strategy.strategy_name().to_string();
-        let authenticator = Authenticator::new().with_strategy(default_strategy.as_str(), strategy);
+    /// Create a `HarbourAuth` using the strategy's own [`Strategy::strategy_name`] as the key.
+    ///
+    /// This is the idiomatic way to create a `HarbourAuth` — no separate name argument needed:
+    ///
+    /// ```rust,ignore
+    /// // Login endpoint — strategy name is automatically "local":
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret));
+    ///
+    /// // Protected routes — strategy name is automatically "jwt":
+    /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+    /// ```
+    pub fn new(strategy: impl Strategy + 'static) -> Self {
+        let default_strategy = strategy.strategy_name().to_string();
+        let authenticator = Authenticator::new().with_strategy(strategy);
 
         Self {
             authenticator: Arc::new(authenticator),
@@ -72,7 +84,25 @@ impl HarbourAuth {
         }
     }
 
-    pub fn with_strategy(
+    /// Register an additional strategy using its own [`Strategy::strategy_name`].
+    pub fn with_strategy(mut self, strategy: impl Strategy + 'static) -> Self {
+        let name = strategy.strategy_name().to_string();
+        Arc::make_mut(&mut self.authenticator)
+            .register_strategy(name.as_str(), strategy);
+        self
+    }
+
+    /// Register an additional strategy under an explicit custom name.
+    ///
+    /// Use this when you need to register multiple instances of the same strategy type under
+    /// different names (e.g. two `JwtStrategy` instances with different secrets):
+    ///
+    /// ```rust,ignore
+    /// let auth = HarbourAuth::new(LocalStrategy::new(store, verifier))
+    ///     .with_strategy_named("jwt-internal", JwtStrategy::hs256(internal_secret))
+    ///     .with_strategy_named("jwt-external", JwtStrategy::hs256(external_secret));
+    /// ```
+    pub fn with_strategy_named(
         mut self,
         strategy_name: impl StrategyName,
         strategy: impl Strategy + 'static,

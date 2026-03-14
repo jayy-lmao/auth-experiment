@@ -126,43 +126,59 @@ let strategy = LocalStrategy::new(
 
 `JwtStrategy` verifies `Authorization: Bearer <token>` headers. `JwtIssuer` signs tokens for login endpoints. They are separate types because in a multi-service setup the signing key (private) lives only in the login service, while the verification key (public) is shared across all services.
 
-```rust
-use harbour_core::{Principal, StrategyName};
-use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+Every strategy implements `strategy_name()` and is self-identifying — no separate name argument needed:
 
-// For larger codebases, a type-safe enum prevents typos across many files.
-// Each variant maps to the string key stored in HarbourAuth's strategy registry.
-enum AppStrategy { Jwt, Local }
+```rust
+use harbour_axum::HarbourAuth;
+use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+use harbour_core::Principal;
+
+let secret = b"super-secret-key";
+
+// JwtStrategy knows its own name ("jwt") — pass it directly:
+let auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+
+// Issue a token (e.g. from a login handler):
+let issuer = JwtIssuer::hs256(secret); // 1-hour expiry by default
+let token = issuer.issue(&Principal::new("user-123").with_name("Alice").with_role("editor"))?;
+```
+
+When you need to register multiple instances of the same strategy type under different names, use `with_strategy_named`:
+
+```rust
+// Two JWT strategies for different audiences — explicit names needed:
+let auth = HarbourAuth::new(LocalStrategy::new(store, verifier))
+    .with_strategy_named("jwt-internal", JwtStrategy::hs256(internal_secret))
+    .with_strategy_named("jwt-external", JwtStrategy::hs256(external_secret));
+```
+
+Use `with_active_strategy` with a type-safe enum to select a per-route strategy without string literals scattered through the codebase:
+
+```rust
+use harbour_core::StrategyName;
+
+// Enum only needed for per-route selection (with_active_strategy),
+// not for registration — strategies register themselves by name.
+enum AppStrategy { Internal, External }
 
 impl StrategyName for AppStrategy {
     fn strategy_name(&self) -> &str {
         match self {
-            Self::Jwt   => "jwt",
-            Self::Local => "local",
+            Self::Internal => "jwt-internal",
+            Self::External => "jwt-external",
         }
     }
 }
-
-let secret = b"super-secret-key";
-
-// Issue a JWT manually (e.g. in a custom login handler):
-let issuer = JwtIssuer::hs256(secret); // 1-hour expiry by default
-let token = issuer.issue(&Principal::new("user-123").with_name("Alice").with_role("editor"))?;
-
-// Register the strategy under a name — the name is the routing key used
-// by middleware to select the right strategy from the registry.
-// `AppStrategy::Jwt` resolves to the string "jwt"; `JwtStrategy::hs256(secret)` is the impl.
-let auth = HarbourAuth::new(AppStrategy::Jwt, JwtStrategy::hs256(secret));
 ```
 
 ### Third-party and custom strategies
 
-`Strategy` is a public async trait — any crate can implement it and register the result with `HarbourAuth`. For example, a community `harbour-strategy-google` crate would expose a `GoogleOAuthStrategy` that implements `Strategy`, and consumers would wire it in exactly like the built-in strategies:
+`Strategy` is a public async trait — any crate can implement it, add a `strategy_name()` method, and pass the result straight to `HarbourAuth::new` / `with_strategy` with no changes to the core. For example, a community `harbour-strategy-google` crate would expose a `GoogleOAuthStrategy` and consumers would wire it in exactly like the built-in strategies:
 
 ```rust
-// Hypothetical third-party strategy — same registration pattern as any other strategy:
-let auth = HarbourAuth::new("google", GoogleOAuthStrategy::new(client_id, client_secret))
-    .with_strategy("local", LocalStrategy::new(store, Argon2PasswordVerifier));
+// Hypothetical third-party strategy — same pattern as any other:
+let auth = HarbourAuth::new(GoogleOAuthStrategy::new(client_id, client_secret))
+    .with_strategy(LocalStrategy::new(store, Argon2PasswordVerifier));
 ```
 
 ## Role-based access control (RBAC)

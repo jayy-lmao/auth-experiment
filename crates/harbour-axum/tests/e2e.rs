@@ -12,10 +12,10 @@ use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
 use tower::ServiceExt;
 
-/// Application-defined strategy enum — demonstrates the enum preference over bare strings.
+/// Application-defined strategy enum — used with `with_active_strategy` to select a
+/// per-route strategy without repeating the string name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppStrategy {
-    User,
     Admin,
     Local,
 }
@@ -23,7 +23,6 @@ enum AppStrategy {
 impl StrategyName for AppStrategy {
     fn strategy_name(&self) -> &str {
         match self {
-            Self::User => "user",
             Self::Admin => "admin",
             Self::Local => "local",
         }
@@ -31,31 +30,27 @@ impl StrategyName for AppStrategy {
 }
 
 fn auth_config() -> HarbourAuth {
-    HarbourAuth::new(
-        AppStrategy::User,
-        StaticBearerStrategy::new(
-            "top-secret-token",
-            Principal::new("user-123").with_name("Demo User"),
+    // Strategies are self-identifying — no separate name argument needed at registration.
+    // StaticBearerStrategy::named gives the instance its name when the same type is used
+    // multiple times ("user" and "admin" both use StaticBearerStrategy with different tokens).
+    HarbourAuth::new(StaticBearerStrategy::named(
+        "user",
+        "top-secret-token",
+        Principal::new("user-123").with_name("Demo User"),
+    ))
+    .with_strategy(StaticBearerStrategy::named(
+        "admin",
+        "admin-token",
+        Principal::new("admin-999").with_name("Admin User"),
+    ))
+    .with_strategy(LocalStrategy::new(
+        InMemoryUserStore::new().with_user(
+            "alice",
+            Principal::new("local-1").with_name("Alice Local"),
+            "password123",
         ),
-    )
-    .with_strategy(
-        AppStrategy::Admin,
-        StaticBearerStrategy::new(
-            "admin-token",
-            Principal::new("admin-999").with_name("Admin User"),
-        ),
-    )
-    .with_strategy(
-        AppStrategy::Local,
-        LocalStrategy::new(
-            InMemoryUserStore::new().with_user(
-                "alice",
-                Principal::new("local-1").with_name("Alice Local"),
-                "password123",
-            ),
-            PlaintextPasswordVerifier,
-        ),
-    )
+        PlaintextPasswordVerifier,
+    ))
 }
 
 fn protected_app() -> Router {
@@ -66,8 +61,7 @@ fn protected_app() -> Router {
         .route("/also-protected", get(protected_handler))
         .layer(middleware::from_fn_with_state(auth.clone(), require_auth));
 
-    // Use `with_active_strategy` + `require_auth` instead of a verbose closure
-    // — addresses shortcoming 1 (strategy selection boilerplate).
+    // Use `with_active_strategy` + `require_auth` to select a per-route strategy.
     let admin = Router::new().route(
         "/admin",
         get(admin_handler).route_layer(middleware::from_fn_with_state(
@@ -488,17 +482,14 @@ async fn local_strategy_without_json_content_type_returns_401() {
 
 #[tokio::test]
 async fn custom_credential_field_names_are_used_for_local_auth() {
-    let auth = HarbourAuth::new(
-        AppStrategy::Local,
-        LocalStrategy::new(
-            InMemoryUserStore::new().with_user(
-                "alice",
-                Principal::new("local-1").with_name("Alice Local"),
-                "password123",
-            ),
-            PlaintextPasswordVerifier,
+    let auth = HarbourAuth::new(LocalStrategy::new(
+        InMemoryUserStore::new().with_user(
+            "alice",
+            Principal::new("local-1").with_name("Alice Local"),
+            "password123",
         ),
-    )
+        PlaintextPasswordVerifier,
+    ))
     // Client sends "email" and "pass" instead of "username" / "password"
     .with_credential_fields("email", "pass");
 
@@ -554,11 +545,10 @@ const JWT_SECRET: &[u8] = b"e2e-jwt-test-secret";
 #[tokio::test]
 async fn jwt_strategy_valid_token_returns_200_and_principal() {
     let issuer = JwtIssuer::hs256(JWT_SECRET);
-    let strategy = JwtStrategy::hs256(JWT_SECRET);
     let principal = Principal::new("jwt-user-1").with_name("JWT User");
     let token = issuer.issue(&principal).unwrap();
 
-    let auth = HarbourAuth::new("jwt", strategy);
+    let auth = HarbourAuth::new(JwtStrategy::hs256(JWT_SECRET));
     let app = Router::new()
         .route("/protected", get(protected_handler))
         .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
@@ -582,8 +572,7 @@ async fn jwt_strategy_valid_token_returns_200_and_principal() {
 
 #[tokio::test]
 async fn jwt_strategy_invalid_token_returns_401() {
-    let strategy = JwtStrategy::hs256(JWT_SECRET);
-    let auth = HarbourAuth::new("jwt", strategy);
+    let auth = HarbourAuth::new(JwtStrategy::hs256(JWT_SECRET));
     let app = Router::new()
         .route("/protected", get(protected_handler))
         .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
@@ -606,14 +595,13 @@ async fn jwt_strategy_invalid_token_returns_401() {
 #[tokio::test]
 async fn jwt_strategy_token_with_roles_principal_has_roles() {
     let issuer = JwtIssuer::hs256(JWT_SECRET);
-    let strategy = JwtStrategy::hs256(JWT_SECRET);
     let principal = Principal::new("jwt-admin-1")
         .with_name("Admin")
         .with_role("admin")
         .with_role("editor");
     let token = issuer.issue(&principal).unwrap();
 
-    let auth = HarbourAuth::new("jwt", strategy);
+    let auth = HarbourAuth::new(JwtStrategy::hs256(JWT_SECRET));
 
     async fn roles_handler(AuthPrincipal(p): AuthPrincipal) -> impl IntoResponse {
         format!(
@@ -666,7 +654,7 @@ async fn with_jwt_issuer_returns_access_token_in_body_after_login() {
     );
 
     let login_auth =
-        HarbourAuth::new("local", LocalStrategy::new(store, PlaintextPasswordVerifier))
+        HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
             .with_jwt_issuer(JwtIssuer::hs256(secret));
 
     let app = Router::new()
@@ -707,7 +695,7 @@ async fn with_jwt_issuer_returns_access_token_in_body_after_login() {
         .expect("access_token field must be present");
 
     // The issued token must be verifiable by JwtStrategy with the same secret.
-    let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+    let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
     let api_app = Router::new()
         .route("/me", get(protected_handler))
         .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
@@ -740,7 +728,7 @@ async fn with_jwt_issuer_bad_credentials_returns_401_without_token() {
     );
 
     let login_auth =
-        HarbourAuth::new("local", LocalStrategy::new(store, PlaintextPasswordVerifier))
+        HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
             .with_jwt_issuer(JwtIssuer::hs256(secret));
 
     let app = Router::new()

@@ -101,6 +101,10 @@ impl JwtStrategy {
 
 #[async_trait]
 impl Strategy for JwtStrategy {
+    fn strategy_name(&self) -> &str {
+        "jwt"
+    }
+
     async fn authenticate(&self, context: &AuthContext) -> Result<Principal, AuthError> {
         let token = context
             .get("bearer_token")
@@ -224,7 +228,7 @@ mod tests {
         let principal = Principal::new("user-42").with_name("Alice");
         let token = issuer.issue(&principal).unwrap();
 
-        let auth = Authenticator::new().with_strategy("jwt", make_strategy());
+        let auth = Authenticator::new().with_strategy(make_strategy());
         let context = AuthContext::new().with_field("bearer_token", token);
 
         let result = auth.authenticate_with("jwt", &context).await.unwrap();
@@ -243,7 +247,7 @@ mod tests {
         parts[1] = "dGFtcGVyZWQ"; // base64("tampered")
         let tampered = parts.join(".");
 
-        let auth = Authenticator::new().with_strategy("jwt", make_strategy());
+        let auth = Authenticator::new().with_strategy(make_strategy());
         let context = AuthContext::new().with_field("bearer_token", tampered);
 
         let err = auth.authenticate_with("jwt", &context).await.unwrap_err();
@@ -252,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_strategy_rejects_missing_token() {
-        let auth = Authenticator::new().with_strategy("jwt", make_strategy());
+        let auth = Authenticator::new().with_strategy(make_strategy());
         let context = AuthContext::new(); // no bearer_token key
 
         let err = auth.authenticate_with("jwt", &context).await.unwrap_err();
@@ -267,7 +271,7 @@ mod tests {
             .with_role("editor");
         let token = issuer.issue(&principal).unwrap();
 
-        let auth = Authenticator::new().with_strategy("jwt", make_strategy());
+        let auth = Authenticator::new().with_strategy(make_strategy());
         let context = AuthContext::new().with_field("bearer_token", token);
 
         let result = auth.authenticate_with("jwt", &context).await.unwrap();
@@ -282,7 +286,7 @@ mod tests {
         let principal = Principal::new("user-1");
         let token = other_issuer.issue(&principal).unwrap();
 
-        let auth = Authenticator::new().with_strategy("jwt", make_strategy());
+        let auth = Authenticator::new().with_strategy(make_strategy());
         let context = AuthContext::new().with_field("bearer_token", token);
 
         let err = auth.authenticate_with("jwt", &context).await.unwrap_err();
