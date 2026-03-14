@@ -6,7 +6,8 @@ This repository contains the smallest useful slice of that vision:
 
 - `harbour-core`: core auth types and strategy interface (framework-agnostic)
 - `harbour-axum`: Axum adapter with middleware + extractors
-- `harbour-strategy-local`: extensible local identifier/password strategy
+- `harbour-strategy-local`: extensible local identifier/password strategy with optional Argon2 password hashing
+- `harbour-strategy-jwt`: JWT Bearer token strategy with issuance and verification
 
 ## Included strategies
 
@@ -17,6 +18,101 @@ This repository contains the smallest useful slice of that vision:
   - checks `local.identifier` + `local.password`
   - supports pluggable `LocalUserStore` + `PasswordVerifier` implementations
   - includes `InMemoryUserStore` and `PlaintextPasswordVerifier` for tests/examples
+  - includes `Argon2PasswordVerifier` + `Argon2PasswordHasher` (enable the `argon2` feature) for production use
+- `JwtStrategy` in `harbour-strategy-jwt`
+  - verifies `Authorization: Bearer <jwt>` headers
+  - supports HS256 (shared secret) and RS256 (RSA key pair) algorithms
+  - pairs with `JwtIssuer` for token generation in login handlers
+
+## Quick Start
+
+The most common production setup is **local password login that issues a JWT**, with subsequent requests authenticated by that JWT. The `harbour-axum` adapter wires this up in a few lines.
+
+```toml
+# Cargo.toml (jwt feature is on by default)
+harbour-axum             = { path = "..." }
+harbour-strategy-local   = { path = "...", features = ["argon2"] }
+harbour-strategy-jwt     = { path = "..." }
+```
+
+```rust
+use harbour_axum::HarbourAuth;
+use harbour_core::Principal;
+use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+use harbour_strategy_local::{
+    Argon2PasswordHasher, Argon2PasswordVerifier, InMemoryUserStore, LocalStrategy,
+};
+
+let secret = b"change-me-in-production";
+
+// Swap InMemoryUserStore for a DB-backed LocalUserStore implementation in production.
+let store = InMemoryUserStore::new().with_user(
+    "alice@example.com",
+    Principal::new("user-1").with_name("Alice").with_role("admin"),
+    Argon2PasswordHasher::hash_password("hunter2")?,
+);
+
+// Login route: verify credentials and respond with {"access_token": "..."}
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::hs256(secret));
+
+// Protected routes: verify the JWT on every request
+let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+```
+
+- **`POST /login`** — apply `require_auth` with `login_auth`. On success the response body contains `{"access_token": "..."}`.
+- **Protected routes** — apply `require_auth` with `api_auth`.
+
+Tokens default to 1-hour expiry. Override when needed:
+
+```rust
+JwtIssuer::hs256(secret).with_expiry(7 * 24 * 3600) // 7 days
+```
+
+### Refresh tokens (opt-in)
+
+Add `.with_refresh_tokens()` to opt in. The login response body becomes
+`{"access_token": "...", "refresh_token": "..."}` automatically. The refresh token
+defaults to a 7-day lifetime; override with `.with_refresh_expiry(secs)`.
+
+Wire up a `/token/refresh` endpoint using `JwtRefreshStrategy` — it validates the
+refresh token from `{"refresh_token": "..."}` in the request body and, combined with
+`with_jwt_issuer`, issues a fresh token pair:
+
+```rust
+use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
+
+// Login: issues {"access_token": "...", "refresh_token": "..."}
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+
+// Refresh endpoint: POST /token/refresh {"refresh_token": "..."} → new token pair
+let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(secret))
+    .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+
+// Protected routes: unchanged — JwtStrategy automatically rejects refresh tokens
+let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+```
+
+`JwtStrategy` always rejects refresh tokens (tokens with `token_type = "refresh"`)
+so they can never be used to call protected API routes directly.
+
+### RS256 variant (asymmetric key pair)
+
+```rust
+// Load PEM files from disk (or environment / secrets manager).
+let private_pem = std::fs::read("private.pem")?;
+let public_pem  = std::fs::read("public.pem")?;
+
+// Login service: sign tokens with the private key.
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::rs256(&private_pem)?);
+
+// Any service: verify tokens with the public key.
+let api_auth = HarbourAuth::new(JwtStrategy::rs256(&public_pem)?);
+```
+
+---
 
 ## Axum usage shape
 
@@ -31,6 +127,109 @@ This repository contains the smallest useful slice of that vision:
   - `Authorization: Bearer <token>` → `bearer_token`
   - JSON body field `username` → `local.identifier`
   - JSON body field `password` → `local.password`
+
+## Production password hashing (Argon2)
+
+Enable the `argon2` feature on `harbour-strategy-local` to unlock production-grade password hashing:
+
+```toml
+harbour-strategy-local = { path = "...", features = ["argon2"] }
+```
+
+```rust
+use harbour_strategy_local::{Argon2PasswordHasher, Argon2PasswordVerifier, InMemoryUserStore, LocalStrategy};
+
+// At registration time — hash and store the password:
+let hash = Argon2PasswordHasher::hash_password("hunter2")?;
+
+// Build the strategy — verify using Argon2id:
+let strategy = LocalStrategy::new(
+    InMemoryUserStore::new().with_user("alice", principal, hash),
+    Argon2PasswordVerifier,
+);
+```
+
+## JWT strategy
+
+`JwtStrategy` verifies `Authorization: Bearer <token>` headers. `JwtIssuer` signs tokens for login endpoints. They are separate types because in a multi-service setup the signing key (private) lives only in the login service, while the verification key (public) is shared across all services.
+
+Every strategy implements `strategy_name()` and is self-identifying — no separate name argument needed:
+
+```rust
+use harbour_axum::HarbourAuth;
+use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+use harbour_core::Principal;
+
+let secret = b"super-secret-key";
+
+// JwtStrategy knows its own name ("jwt") — pass it directly:
+let auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+
+// Issue a token (e.g. from a login handler):
+let issuer = JwtIssuer::hs256(secret); // 1-hour expiry by default
+let token = issuer.issue(&Principal::new("user-123").with_name("Alice").with_role("editor"))?;
+```
+
+When you need to register multiple instances of the same strategy type under different names, use `with_strategy_named`:
+
+```rust
+// Two JWT strategies for different audiences — explicit names needed:
+let auth = HarbourAuth::new(LocalStrategy::new(store, verifier))
+    .with_strategy_named("jwt-internal", JwtStrategy::hs256(internal_secret))
+    .with_strategy_named("jwt-external", JwtStrategy::hs256(external_secret));
+```
+
+Use `with_active_strategy` with a type-safe enum to select a per-route strategy without string literals scattered through the codebase:
+
+```rust
+use harbour_core::StrategyName;
+
+// Enum only needed for per-route selection (with_active_strategy),
+// not for registration — strategies register themselves by name.
+enum AppStrategy { Internal, External }
+
+impl StrategyName for AppStrategy {
+    fn strategy_name(&self) -> &str {
+        match self {
+            Self::Internal => "jwt-internal",
+            Self::External => "jwt-external",
+        }
+    }
+}
+```
+
+### Third-party and custom strategies
+
+`Strategy` is a public async trait — any crate can implement it, add a `strategy_name()` method, and pass the result straight to `HarbourAuth::new` / `with_strategy` with no changes to the core. For example, a community `harbour-strategy-google` crate would expose a `GoogleOAuthStrategy` and consumers would wire it in exactly like the built-in strategies:
+
+```rust
+// Hypothetical third-party strategy — same pattern as any other:
+let auth = HarbourAuth::new(GoogleOAuthStrategy::new(client_id, client_secret))
+    .with_strategy(LocalStrategy::new(store, Argon2PasswordVerifier));
+```
+
+## Role-based access control (RBAC)
+
+`Principal` now carries a `roles` field, populated from the `LocalUserStore` or from JWT claims:
+
+```rust
+use harbour_core::Principal;
+
+let p = Principal::new("user-1").with_role("admin").with_role("editor");
+assert!(p.has_role("admin"));
+assert!(!p.has_role("viewer"));
+```
+
+In a handler, gate access by role after extracting the principal:
+
+```rust
+async fn admin_only(AuthPrincipal(p): AuthPrincipal) -> impl IntoResponse {
+    if !p.has_role("admin") {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // ...
+}
+```
 
 ## Comparison with PassportJS Local Strategy
 
@@ -51,6 +250,9 @@ The term "identifier" is used internally (rather than "username") to signal that
 | Pluggable user lookup | verify callback provided by the developer | `LocalUserStore` trait implementation |
 | Multiple strategies registered | `passport.use('admin', new LocalStrategy(...))` | `.with_strategy("admin", LocalStrategy::new(...))` |
 | Invalid credentials → 401 | `done(null, false)` in verify callback | `Err(AuthError::InvalidCredentials)` |
+| Password hashing | `bcrypt` via third-party libs | `Argon2PasswordVerifier` / `Argon2PasswordHasher` (feature flag) |
+| JWT Bearer auth | `passport-jwt` package | `harbour-strategy-jwt` crate |
+| Role/claims-based access | `req.user.roles` populated by verify callback | `Principal::roles` + `Principal::has_role()` |
 
 ### Remaining differences in usage / behaviour / developer experience
 

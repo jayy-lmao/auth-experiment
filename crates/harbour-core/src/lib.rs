@@ -47,6 +47,8 @@ impl<T: StrategyName + ?Sized> StrategyName for &T {
 pub struct Principal {
     pub id: String,
     pub name: Option<String>,
+    /// Roles assigned to this principal, used for role-based access control (RBAC).
+    pub roles: Vec<String>,
 }
 
 impl Principal {
@@ -54,12 +56,32 @@ impl Principal {
         Self {
             id: id.into(),
             name: None,
+            roles: Vec::new(),
         }
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
+    }
+
+    /// Add a role to this principal.
+    ///
+    /// ```rust
+    /// use harbour_core::Principal;
+    ///
+    /// let p = Principal::new("user-1").with_role("admin").with_role("editor");
+    /// assert!(p.has_role("admin"));
+    /// assert!(!p.has_role("viewer"));
+    /// ```
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.roles.push(role.into());
+        self
+    }
+
+    /// Returns `true` if this principal has the given role.
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
     }
 }
 
@@ -96,6 +118,18 @@ pub enum AuthError {
 
 #[async_trait]
 pub trait Strategy: Send + Sync {
+    /// The name under which this strategy is registered in the strategy registry.
+    ///
+    /// This name is used as the key when the strategy is passed directly to
+    /// [`Authenticator::with_strategy`] or [`HarbourAuth::new`].  It can always be overridden by
+    /// calling `with_strategy_named("custom-name", strategy)`.
+    ///
+    /// Built-in strategies return:
+    /// - [`LocalStrategy`][harbour_strategy_local] → `"local"`
+    /// - [`JwtStrategy`][harbour_strategy_jwt] → `"jwt"`
+    /// - [`StaticBearerStrategy`] → `"bearer"` (or a custom name if [`StaticBearerStrategy::named`] is used)
+    fn strategy_name(&self) -> &str;
+
     async fn authenticate(&self, context: &AuthContext) -> Result<Principal, AuthError>;
 }
 
@@ -111,25 +145,40 @@ impl Authenticator {
         Self::default()
     }
 
-    pub fn with_strategy(
+    /// Register a strategy under its own [`Strategy::strategy_name`].
+    ///
+    /// Use this for the common case — each strategy knows its natural name (`"local"`, `"jwt"`, …).
+    pub fn with_strategy(mut self, strategy: impl Strategy + 'static) -> Self {
+        self.register_strategy_impl(strategy.strategy_name().to_string(), strategy);
+        self
+    }
+
+    /// Register a strategy under an explicit custom name, overriding its `strategy_name`.
+    ///
+    /// Useful when you need multiple instances of the same type with different names, e.g.
+    /// two `JwtStrategy` instances for internal and external tokens.
+    pub fn with_strategy_named(
         mut self,
-        strategy_name: impl StrategyName,
+        name: impl StrategyName,
         strategy: impl Strategy + 'static,
     ) -> Self {
-        self.register_strategy(strategy_name, strategy);
+        self.register_strategy_impl(name.strategy_name().to_string(), strategy);
         self
     }
 
     pub fn register_strategy(
         &mut self,
-        strategy_name: impl StrategyName,
+        name: impl StrategyName,
         strategy: impl Strategy + 'static,
     ) {
-        let strategy_name = strategy_name.strategy_name().to_string();
+        self.register_strategy_impl(name.strategy_name().to_string(), strategy);
+    }
+
+    fn register_strategy_impl(&mut self, name: String, strategy: impl Strategy + 'static) {
         if self.default_strategy.is_none() {
-            self.default_strategy = Some(strategy_name.clone());
+            self.default_strategy = Some(name.clone());
         }
-        self.strategies.insert(strategy_name, Arc::new(strategy));
+        self.strategies.insert(name, Arc::new(strategy));
     }
 
     pub fn set_default_strategy(&mut self, strategy_name: impl StrategyName) {
@@ -162,13 +211,39 @@ impl Authenticator {
 
 /// Deterministic bearer strategy for the Harbour MVP.
 pub struct StaticBearerStrategy {
+    name: String,
     token: String,
     principal: Principal,
 }
 
 impl StaticBearerStrategy {
+    /// Create a strategy with the default name `"bearer"`.
     pub fn new(token: impl Into<String>, principal: Principal) -> Self {
         Self {
+            name: "bearer".to_string(),
+            token: token.into(),
+            principal,
+        }
+    }
+
+    /// Create a strategy with a custom name.
+    ///
+    /// Use this when you need to register multiple `StaticBearerStrategy` instances under
+    /// different names (e.g. `"user"` and `"admin"` in tests):
+    ///
+    /// ```rust
+    /// use harbour_core::{StaticBearerStrategy, Principal};
+    ///
+    /// let user  = StaticBearerStrategy::named("user",  "user-token",  Principal::new("u1"));
+    /// let admin = StaticBearerStrategy::named("admin", "admin-token", Principal::new("a1"));
+    /// ```
+    pub fn named(
+        name: impl Into<String>,
+        token: impl Into<String>,
+        principal: Principal,
+    ) -> Self {
+        Self {
+            name: name.into(),
             token: token.into(),
             principal,
         }
@@ -177,6 +252,10 @@ impl StaticBearerStrategy {
 
 #[async_trait]
 impl Strategy for StaticBearerStrategy {
+    fn strategy_name(&self) -> &str {
+        &self.name
+    }
+
     async fn authenticate(&self, context: &AuthContext) -> Result<Principal, AuthError> {
         let token = context
             .get("bearer_token")
@@ -194,12 +273,28 @@ impl Strategy for StaticBearerStrategy {
 mod tests {
     use super::*;
 
+    #[test]
+    fn principal_roles_can_be_assigned_and_checked() {
+        let p = Principal::new("user-1")
+            .with_name("Alice")
+            .with_role("admin")
+            .with_role("editor");
+        assert!(p.has_role("admin"));
+        assert!(p.has_role("editor"));
+        assert!(!p.has_role("viewer"));
+    }
+
+    #[test]
+    fn principal_has_empty_roles_by_default() {
+        let p = Principal::new("user-1");
+        assert!(p.roles.is_empty());
+        assert!(!p.has_role("admin"));
+    }
+
     #[tokio::test]
     async fn static_bearer_authenticates_with_matching_token() {
-        let auth = Authenticator::new().with_strategy(
-            "bearer",
-            StaticBearerStrategy::new("secret", Principal::new("user-1")),
-        );
+        let auth = Authenticator::new()
+            .with_strategy(StaticBearerStrategy::new("secret", Principal::new("user-1")));
         let context = AuthContext::new().with_field("bearer_token", "secret");
 
         let principal = auth.authenticate(&context).await.unwrap();
@@ -208,10 +303,8 @@ mod tests {
 
     #[tokio::test]
     async fn static_bearer_rejects_bad_token() {
-        let auth = Authenticator::new().with_strategy(
-            "bearer",
-            StaticBearerStrategy::new("secret", Principal::new("user-1")),
-        );
+        let auth = Authenticator::new()
+            .with_strategy(StaticBearerStrategy::new("secret", Principal::new("user-1")));
         let context = AuthContext::new().with_field("bearer_token", "wrong");
 
         let err = auth.authenticate(&context).await.unwrap_err();
@@ -221,14 +314,8 @@ mod tests {
     #[tokio::test]
     async fn can_select_specific_registered_strategy() {
         let mut auth = Authenticator::new()
-            .with_strategy(
-                "user",
-                StaticBearerStrategy::new("user-token", Principal::new("user-1")),
-            )
-            .with_strategy(
-                "admin",
-                StaticBearerStrategy::new("admin-token", Principal::new("admin-1")),
-            );
+            .with_strategy(StaticBearerStrategy::named("user",  "user-token",  Principal::new("user-1")))
+            .with_strategy(StaticBearerStrategy::named("admin", "admin-token", Principal::new("admin-1")));
         auth.set_default_strategy("user");
 
         let context = AuthContext::new().with_field("bearer_token", "admin-token");

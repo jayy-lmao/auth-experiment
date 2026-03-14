@@ -59,9 +59,21 @@ impl Clone for HarbourAuth {
 }
 
 impl HarbourAuth {
-    pub fn new(default_strategy: impl StrategyName, strategy: impl Strategy + 'static) -> Self {
-        let default_strategy = default_strategy.strategy_name().to_string();
-        let authenticator = Authenticator::new().with_strategy(default_strategy.as_str(), strategy);
+    /// Create a `HarbourAuth` using the strategy's own [`Strategy::strategy_name`] as the key.
+    ///
+    /// This is the idiomatic way to create a `HarbourAuth` — no separate name argument needed:
+    ///
+    /// ```rust,ignore
+    /// // Login endpoint — strategy name is automatically "local":
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret));
+    ///
+    /// // Protected routes — strategy name is automatically "jwt":
+    /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+    /// ```
+    pub fn new(strategy: impl Strategy + 'static) -> Self {
+        let default_strategy = strategy.strategy_name().to_string();
+        let authenticator = Authenticator::new().with_strategy(strategy);
 
         Self {
             authenticator: Arc::new(authenticator),
@@ -72,7 +84,25 @@ impl HarbourAuth {
         }
     }
 
-    pub fn with_strategy(
+    /// Register an additional strategy using its own [`Strategy::strategy_name`].
+    pub fn with_strategy(mut self, strategy: impl Strategy + 'static) -> Self {
+        let name = strategy.strategy_name().to_string();
+        Arc::make_mut(&mut self.authenticator)
+            .register_strategy(name.as_str(), strategy);
+        self
+    }
+
+    /// Register an additional strategy under an explicit custom name.
+    ///
+    /// Use this when you need to register multiple instances of the same strategy type under
+    /// different names (e.g. two `JwtStrategy` instances with different secrets):
+    ///
+    /// ```rust,ignore
+    /// let auth = HarbourAuth::new(LocalStrategy::new(store, verifier))
+    ///     .with_strategy_named("jwt-internal", JwtStrategy::hs256(internal_secret))
+    ///     .with_strategy_named("jwt-external", JwtStrategy::hs256(external_secret));
+    /// ```
+    pub fn with_strategy_named(
         mut self,
         strategy_name: impl StrategyName,
         strategy: impl Strategy + 'static,
@@ -126,6 +156,70 @@ impl HarbourAuth {
     {
         self.on_authenticated = Some(Arc::new(hook));
         self
+    }
+
+    /// Issue a signed JWT in the response body after every successful authentication.
+    ///
+    /// By default the response body is `{"access_token": "..."}`.
+    ///
+    /// When the issuer has refresh tokens enabled (via [`JwtIssuer::with_refresh_tokens`]),
+    /// the response body is `{"access_token": "...", "refresh_token": "..."}` instead.
+    ///
+    /// This is the recommended way to wire up a login endpoint: the [`JwtIssuer`] is stored
+    /// inside `HarbourAuth` and invoked automatically — no manual `on_authenticated` hook needed.
+    ///
+    /// Enable the `jwt` feature on `harbour-axum` (on by default) to use this method.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // HS256 — access token only (default):
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret));
+    ///
+    /// // HS256 — access + refresh token (opt-in):
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Refresh endpoint: validate the refresh token and issue a new token pair.
+    /// let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(secret))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Protected routes: verify the access token on every request.
+    /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+    /// ```
+    #[cfg(feature = "jwt")]
+    pub fn with_jwt_issuer(self, issuer: harbour_strategy_jwt::JwtIssuer) -> Self {
+        let issuer = Arc::new(issuer);
+        self.with_on_authenticated(move |principal, _response| {
+            let access_token = match issuer.issue(principal) {
+                Ok(t) => t,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+
+            let body = if issuer.has_refresh_tokens() {
+                let refresh_token = match issuer.issue_refresh(principal) {
+                    Ok(t) => t,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                serde_json::json!({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                })
+                .to_string()
+            } else {
+                serde_json::json!({"access_token": access_token}).to_string()
+            };
+
+            // Response::builder() only fails for invalid header values. With a
+            // hardcoded status and "application/json" content-type that is impossible
+            // in practice, so the fallback to 500 is a belt-and-suspenders guard.
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        })
     }
 
     /// Override the JSON body field names used to extract credentials.
@@ -225,6 +319,7 @@ pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
 /// - `Authorization: Bearer <token>` → `bearer_token`
 /// - JSON body fields `username_field` and `password_field` → `local.identifier` / `local.password`
 ///   (aligns with the PassportJS Local Strategy field naming convention)
+/// - JSON body field `refresh_token` → `refresh_token` (used by [`JwtRefreshStrategy`])
 pub fn context_from_request(
     headers: &HeaderMap,
     body: &[u8],
@@ -239,6 +334,9 @@ pub fn context_from_request(
         }
         if let Some(password) = json.get(password_field).and_then(|v| v.as_str()) {
             context = context.with_field("local.password", password);
+        }
+        if let Some(refresh_token) = json.get("refresh_token").and_then(|v| v.as_str()) {
+            context = context.with_field("refresh_token", refresh_token);
         }
         // If the body is not JSON, or the fields are missing/wrong type, the
         // local.identifier / local.password keys are simply absent from the context.
