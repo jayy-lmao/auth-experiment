@@ -62,17 +62,29 @@ let strategy = LocalStrategy::new(
 ## JWT strategy
 
 ```rust
+use harbour_core::{Principal, StrategyName};
 use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
-use harbour_core::Principal;
+
+// Use a type-safe strategy enum (preferred over bare strings).
+enum AppStrategy { Jwt, Local }
+
+impl StrategyName for AppStrategy {
+    fn strategy_name(&self) -> &str {
+        match self {
+            Self::Jwt   => "jwt",
+            Self::Local => "local",
+        }
+    }
+}
 
 let secret = b"super-secret-key";
 
 // Issue a JWT in a login handler:
 let issuer = JwtIssuer::hs256(secret, 3600 /* expiry seconds */);
-let token = issuer.issue(&Principal::new("user-1").with_name("Alice").with_role("editor"))?;
+let token = issuer.issue(&Principal::new("user-123").with_name("Alice").with_role("editor"))?;
 
-// Protect routes with JwtStrategy:
-let auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+// Protect routes with JwtStrategy — strategy name comes from the enum, not a bare string:
+let auth = HarbourAuth::new(AppStrategy::Jwt, JwtStrategy::hs256(secret));
 ```
 
 ## Role-based access control (RBAC)
