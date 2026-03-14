@@ -1,6 +1,47 @@
 use async_trait::async_trait;
 use std::{collections::HashMap, sync::Arc};
 
+/// Type-safe strategy identifier.
+///
+/// Implement this trait on an application-defined enum to avoid bare string strategy names:
+///
+/// ```rust
+/// use harbour_core::StrategyName;
+///
+/// enum MyStrategy { User, Admin, Local }
+///
+/// impl StrategyName for MyStrategy {
+///     fn strategy_name(&self) -> &str {
+///         match self {
+///             Self::User => "user",
+///             Self::Admin => "admin",
+///             Self::Local => "local",
+///         }
+///     }
+/// }
+/// ```
+pub trait StrategyName {
+    fn strategy_name(&self) -> &str;
+}
+
+impl StrategyName for str {
+    fn strategy_name(&self) -> &str {
+        self
+    }
+}
+
+impl StrategyName for String {
+    fn strategy_name(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<T: StrategyName + ?Sized> StrategyName for &T {
+    fn strategy_name(&self) -> &str {
+        (**self).strategy_name()
+    }
+}
+
 /// Authenticated caller information injected into request handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -72,7 +113,7 @@ impl Authenticator {
 
     pub fn with_strategy(
         mut self,
-        strategy_name: impl Into<String>,
+        strategy_name: impl StrategyName,
         strategy: impl Strategy + 'static,
     ) -> Self {
         self.register_strategy(strategy_name, strategy);
@@ -81,18 +122,18 @@ impl Authenticator {
 
     pub fn register_strategy(
         &mut self,
-        strategy_name: impl Into<String>,
+        strategy_name: impl StrategyName,
         strategy: impl Strategy + 'static,
     ) {
-        let strategy_name = strategy_name.into();
+        let strategy_name = strategy_name.strategy_name().to_string();
         if self.default_strategy.is_none() {
             self.default_strategy = Some(strategy_name.clone());
         }
         self.strategies.insert(strategy_name, Arc::new(strategy));
     }
 
-    pub fn set_default_strategy(&mut self, strategy_name: impl Into<String>) {
-        self.default_strategy = Some(strategy_name.into());
+    pub fn set_default_strategy(&mut self, strategy_name: impl StrategyName) {
+        self.default_strategy = Some(strategy_name.strategy_name().to_string());
     }
 
     pub async fn authenticate(&self, context: &AuthContext) -> Result<Principal, AuthError> {
@@ -106,13 +147,14 @@ impl Authenticator {
 
     pub async fn authenticate_with(
         &self,
-        strategy_name: &str,
+        strategy_name: impl StrategyName,
         context: &AuthContext,
     ) -> Result<Principal, AuthError> {
+        let name = strategy_name.strategy_name();
         let strategy = self
             .strategies
-            .get(strategy_name)
-            .ok_or_else(|| AuthError::StrategyNotFound(strategy_name.to_string()))?;
+            .get(name)
+            .ok_or_else(|| AuthError::StrategyNotFound(name.to_string()))?;
 
         strategy.authenticate(context).await
     }
