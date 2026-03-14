@@ -26,18 +26,16 @@ This repository contains the smallest useful slice of that vision:
 
 ## Quick Start
 
-The most common production setup is **local password login that issues a JWT**, with subsequent requests authenticated by that JWT. The example below sets this up in one block.
+The most common production setup is **local password login that issues a JWT**, with subsequent requests authenticated by that JWT. The `harbour-axum` adapter wires this up in a few lines.
 
 ```toml
-# Cargo.toml
+# Cargo.toml (jwt feature is on by default)
 harbour-axum             = { path = "..." }
 harbour-strategy-local   = { path = "...", features = ["argon2"] }
 harbour-strategy-jwt     = { path = "..." }
 ```
 
 ```rust
-use std::sync::Arc;
-use axum::http::HeaderValue;
 use harbour_axum::HarbourAuth;
 use harbour_core::Principal;
 use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
@@ -46,8 +44,6 @@ use harbour_strategy_local::{
 };
 
 let secret = b"change-me-in-production";
-let issuer = Arc::new(JwtIssuer::hs256(secret, 3600 /* 1 hour */));
-let issuer_hook = Arc::clone(&issuer);
 
 // Swap InMemoryUserStore for a DB-backed LocalUserStore implementation in production.
 let store = InMemoryUserStore::new().with_user(
@@ -56,25 +52,23 @@ let store = InMemoryUserStore::new().with_user(
     Argon2PasswordHasher::hash_password("hunter2")?,
 );
 
-let auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
-    .with_strategy("jwt", JwtStrategy::hs256(secret))
-    // After every successful local login, attach a signed JWT to the response.
-    .with_on_authenticated(move |principal, response| {
-        if let Ok(token) = issuer_hook.issue(principal) {
-            let (mut parts, body) = response.into_parts();
-            if let Ok(val) = HeaderValue::from_str(&token) {
-                parts.headers.insert("x-auth-token", val);
-            }
-            axum::response::Response::from_parts(parts, body)
-        } else {
-            response
-        }
-    });
+// Login route: verify credentials and respond with {"access_token": "..."}
+let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::hs256(secret));
+
+// Protected routes: verify the JWT on every request
+let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
 ```
 
-- **`POST /login`** — apply `require_auth` with `"local"` as the active strategy. On success the hook attaches the JWT in `x-auth-token`.
-- **Protected routes** — apply `require_auth` with `"jwt"` as the active strategy (or set it as the default on `auth`).
+- **`POST /login`** — apply `require_auth` with `login_auth`. On success the response body contains `{"access_token": "..."}`.
+- **Protected routes** — apply `require_auth` with `api_auth`.
 - String strategy names (`"local"`, `"jwt"`) are fine for small/single-file setups. For larger codebases a type-safe enum is preferred — see the [JWT strategy section](#jwt-strategy) below.
+
+Tokens default to 1-hour expiry. Override when needed:
+
+```rust
+JwtIssuer::hs256(secret).with_expiry(7 * 24 * 3600) // 7 days
+```
 
 ### RS256 variant (asymmetric key pair)
 
@@ -83,8 +77,12 @@ let auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVer
 let private_pem = std::fs::read("private.pem")?;
 let public_pem  = std::fs::read("public.pem")?;
 
-let issuer   = JwtIssuer::rs256(&private_pem, 3600)?;  // signing key (login service only)
-let strategy = JwtStrategy::rs256(&public_pem)?;        // verification key (any service)
+// Login service: sign tokens with the private key.
+let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::rs256(&private_pem)?);
+
+// Any service: verify tokens with the public key.
+let api_auth = HarbourAuth::new("jwt", JwtStrategy::rs256(&public_pem)?);
 ```
 
 ---
@@ -126,11 +124,14 @@ let strategy = LocalStrategy::new(
 
 ## JWT strategy
 
+`JwtStrategy` verifies `Authorization: Bearer <token>` headers. `JwtIssuer` signs tokens for login endpoints. They are separate types because in a multi-service setup the signing key (private) lives only in the login service, while the verification key (public) is shared across all services.
+
 ```rust
 use harbour_core::{Principal, StrategyName};
 use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
 
-// Use a type-safe strategy enum (preferred over bare strings).
+// For larger codebases, a type-safe enum prevents typos across many files.
+// Each variant maps to the string key stored in HarbourAuth's strategy registry.
 enum AppStrategy { Jwt, Local }
 
 impl StrategyName for AppStrategy {
@@ -144,12 +145,24 @@ impl StrategyName for AppStrategy {
 
 let secret = b"super-secret-key";
 
-// Issue a JWT in a login handler:
-let issuer = JwtIssuer::hs256(secret, 3600 /* expiry seconds */);
+// Issue a JWT manually (e.g. in a custom login handler):
+let issuer = JwtIssuer::hs256(secret); // 1-hour expiry by default
 let token = issuer.issue(&Principal::new("user-123").with_name("Alice").with_role("editor"))?;
 
-// Protect routes with JwtStrategy — strategy name comes from the enum, not a bare string:
+// Register the strategy under a name — the name is the routing key used
+// by middleware to select the right strategy from the registry.
+// `AppStrategy::Jwt` resolves to the string "jwt"; `JwtStrategy::hs256(secret)` is the impl.
 let auth = HarbourAuth::new(AppStrategy::Jwt, JwtStrategy::hs256(secret));
+```
+
+### Third-party and custom strategies
+
+`Strategy` is a public async trait — any crate can implement it and register the result with `HarbourAuth`. For example, a community `harbour-strategy-google` crate would expose a `GoogleOAuthStrategy` that implements `Strategy`, and consumers would wire it in exactly like the built-in strategies:
+
+```rust
+// Hypothetical third-party strategy — same registration pattern as any other strategy:
+let auth = HarbourAuth::new("google", GoogleOAuthStrategy::new(client_id, client_secret))
+    .with_strategy("local", LocalStrategy::new(store, Argon2PasswordVerifier));
 ```
 
 ## Role-based access control (RBAC)

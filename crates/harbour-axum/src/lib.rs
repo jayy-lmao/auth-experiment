@@ -128,6 +128,45 @@ impl HarbourAuth {
         self
     }
 
+    /// Issue a signed JWT (`{"access_token": "..."}`) in the response body after every
+    /// successful authentication.
+    ///
+    /// This is the recommended way to wire up a login endpoint: the [`JwtIssuer`] is stored
+    /// inside `HarbourAuth` and invoked automatically — no manual `on_authenticated` hook needed.
+    ///
+    /// Enable the `jwt` feature on `harbour-axum` (on by default) to use this method.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Login route: verify credentials, respond with {"access_token": "..."}
+    /// let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret));
+    ///
+    /// // Protected routes: verify the JWT on every request
+    /// let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+    /// ```
+    #[cfg(feature = "jwt")]
+    pub fn with_jwt_issuer(self, issuer: harbour_strategy_jwt::JwtIssuer) -> Self {
+        let issuer = Arc::new(issuer);
+        self.with_on_authenticated(move |principal, _response| {
+            match issuer.issue(principal) {
+                Ok(token) => {
+                    let body = serde_json::json!({"access_token": token}).to_string();
+                    // Response::builder() only fails for invalid header values. With a
+                    // hardcoded status and "application/json" content-type that is impossible
+                    // in practice, so the fallback to 500 is a belt-and-suspenders guard.
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        })
+    }
+
     /// Override the JSON body field names used to extract credentials.
     ///
     /// Defaults to `username` / `password` (PassportJS Local Strategy convention).

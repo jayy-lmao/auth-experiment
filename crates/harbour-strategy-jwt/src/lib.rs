@@ -67,7 +67,7 @@ pub enum JwtError {
 /// use harbour_core::{Authenticator, Principal};
 ///
 /// let secret = b"super-secret-key";
-/// let issuer = JwtIssuer::hs256(secret, 3600);
+/// let issuer = JwtIssuer::hs256(secret);
 /// let strategy = JwtStrategy::hs256(secret);
 ///
 /// let token = issuer.issue(&Principal::new("user-1").with_role("admin")).unwrap();
@@ -113,10 +113,15 @@ impl Strategy for JwtStrategy {
     }
 }
 
+/// Default token lifetime used by [`JwtIssuer`] when no expiry is specified.
+///
+/// Override with [`JwtIssuer::with_expiry`] when a different lifetime is needed.
+pub const DEFAULT_TOKEN_EXPIRY_SECS: u64 = 3600; // 1 hour
+
 /// Issues signed JWTs that can be verified by [`JwtStrategy`].
 ///
-/// Intended for use in login handlers (e.g. inside an `on_authenticated` hook or after
-/// password verification) to hand the client a short-lived token.
+/// Intended for use in login handlers — typically via [`HarbourAuth::with_jwt_issuer`] in the
+/// Axum adapter, which wires everything up automatically.
 ///
 /// ## Example
 ///
@@ -124,13 +129,13 @@ impl Strategy for JwtStrategy {
 /// use harbour_strategy_jwt::JwtIssuer;
 /// use harbour_core::Principal;
 ///
-/// let issuer = JwtIssuer::hs256(b"super-secret-key", 3600);
-/// let principal = Principal::new("user-1")
-///     .with_name("Alice")
-///     .with_role("editor");
+/// // 1-hour expiry by default:
+/// let issuer = JwtIssuer::hs256(b"super-secret-key");
 ///
-/// let token = issuer.issue(&principal).expect("failed to issue token");
-/// // Return `token` to the client in the response body or a custom header.
+/// // Override when needed:
+/// let issuer = JwtIssuer::hs256(b"super-secret-key").with_expiry(7 * 24 * 3600); // 1 week
+///
+/// let token = issuer.issue(&Principal::new("user-1").with_name("Alice")).unwrap();
 /// ```
 pub struct JwtIssuer {
     encoding_key: EncodingKey,
@@ -141,25 +146,39 @@ pub struct JwtIssuer {
 impl JwtIssuer {
     /// Create a JWT issuer that signs tokens with HMAC-SHA-256.
     ///
-    /// `expiry_secs` is how long (in seconds) issued tokens remain valid.
-    pub fn hs256(secret: &[u8], expiry_secs: u64) -> Self {
+    /// Tokens are valid for [`DEFAULT_TOKEN_EXPIRY_SECS`] (1 hour) by default.
+    /// Call `.with_expiry(secs)` to override.
+    pub fn hs256(secret: &[u8]) -> Self {
         Self {
             encoding_key: EncodingKey::from_secret(secret),
             header: Header::new(jsonwebtoken::Algorithm::HS256),
-            expiry_secs,
+            expiry_secs: DEFAULT_TOKEN_EXPIRY_SECS,
         }
     }
 
     /// Create a JWT issuer that signs tokens with RSA-SHA-256.
     ///
     /// `private_key_pem` should be a PEM-encoded RSA private key.
-    pub fn rs256(private_key_pem: &[u8], expiry_secs: u64) -> Result<Self, JwtError> {
+    /// Tokens are valid for [`DEFAULT_TOKEN_EXPIRY_SECS`] (1 hour) by default.
+    /// Call `.with_expiry(secs)` to override.
+    pub fn rs256(private_key_pem: &[u8]) -> Result<Self, JwtError> {
         Ok(Self {
             encoding_key: EncodingKey::from_rsa_pem(private_key_pem)
                 .map_err(JwtError::Encoding)?,
             header: Header::new(jsonwebtoken::Algorithm::RS256),
-            expiry_secs,
+            expiry_secs: DEFAULT_TOKEN_EXPIRY_SECS,
         })
+    }
+
+    /// Override the token lifetime.
+    ///
+    /// ```rust,ignore
+    /// // Tokens valid for 7 days:
+    /// let issuer = JwtIssuer::hs256(secret).with_expiry(7 * 24 * 3600);
+    /// ```
+    pub fn with_expiry(mut self, expiry_secs: u64) -> Self {
+        self.expiry_secs = expiry_secs;
+        self
     }
 
     /// Issue a signed JWT for the given [`Principal`].
@@ -192,7 +211,7 @@ mod tests {
     const SECRET: &[u8] = b"test-secret-key-for-harbour";
 
     fn make_issuer() -> JwtIssuer {
-        JwtIssuer::hs256(SECRET, 3600)
+        JwtIssuer::hs256(SECRET)
     }
 
     fn make_strategy() -> JwtStrategy {
@@ -259,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn jwt_strategy_rejects_token_signed_with_different_secret() {
-        let other_issuer = JwtIssuer::hs256(b"a-different-secret", 3600);
+        let other_issuer = JwtIssuer::hs256(b"a-different-secret");
         let principal = Principal::new("user-1");
         let token = other_issuer.issue(&principal).unwrap();
 

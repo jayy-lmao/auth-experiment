@@ -553,7 +553,7 @@ const JWT_SECRET: &[u8] = b"e2e-jwt-test-secret";
 
 #[tokio::test]
 async fn jwt_strategy_valid_token_returns_200_and_principal() {
-    let issuer = JwtIssuer::hs256(JWT_SECRET, 3600);
+    let issuer = JwtIssuer::hs256(JWT_SECRET);
     let strategy = JwtStrategy::hs256(JWT_SECRET);
     let principal = Principal::new("jwt-user-1").with_name("JWT User");
     let token = issuer.issue(&principal).unwrap();
@@ -605,7 +605,7 @@ async fn jwt_strategy_invalid_token_returns_401() {
 
 #[tokio::test]
 async fn jwt_strategy_token_with_roles_principal_has_roles() {
-    let issuer = JwtIssuer::hs256(JWT_SECRET, 3600);
+    let issuer = JwtIssuer::hs256(JWT_SECRET);
     let strategy = JwtStrategy::hs256(JWT_SECRET);
     let principal = Principal::new("jwt-admin-1")
         .with_name("Admin")
@@ -649,5 +649,122 @@ async fn jwt_strategy_token_with_roles_principal_has_roles() {
     assert!(body_str.starts_with("jwt-admin-1:"));
     assert!(body_str.contains("admin"));
     assert!(body_str.contains("editor"));
+}
+
+// ── with_jwt_issuer convenience method ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn with_jwt_issuer_returns_access_token_in_body_after_login() {
+    // Verifies the full login → JWT flow: local creds in, {"access_token": "..."} out.
+    // The returned token must be a valid JWT verifiable by JwtStrategy.
+    let secret = b"with-jwt-issuer-test-secret";
+
+    let store = InMemoryUserStore::new().with_user(
+        "bob",
+        Principal::new("user-jwt-flow-1").with_name("Bob").with_role("member"),
+        "pass123",
+    );
+
+    let login_auth =
+        HarbourAuth::new("local", LocalStrategy::new(store, PlaintextPasswordVerifier))
+            .with_jwt_issuer(JwtIssuer::hs256(secret));
+
+    let app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"bob","password":"pass123"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(content_type.contains("application/json"));
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .expect("access_token field must be present");
+
+    // The issued token must be verifiable by JwtStrategy with the same secret.
+    let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+    let api_app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let api_response = api_app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_response.status(), StatusCode::OK);
+    let api_body = to_bytes(api_response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&api_body[..], b"user-jwt-flow-1:Bob");
+}
+
+#[tokio::test]
+async fn with_jwt_issuer_bad_credentials_returns_401_without_token() {
+    let secret = b"with-jwt-issuer-test-secret";
+
+    let store = InMemoryUserStore::new().with_user(
+        "carol",
+        Principal::new("user-carol-1"),
+        "correct",
+    );
+
+    let login_auth =
+        HarbourAuth::new("local", LocalStrategy::new(store, PlaintextPasswordVerifier))
+            .with_jwt_issuer(JwtIssuer::hs256(secret));
+
+    let app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"carol","password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
