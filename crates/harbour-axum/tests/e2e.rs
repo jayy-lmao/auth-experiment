@@ -8,7 +8,7 @@ use axum::{
 };
 use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal};
 use harbour_core::{Principal, StaticBearerStrategy, StrategyName};
-use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
+use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
 use tower::ServiceExt;
 
@@ -756,3 +756,208 @@ async fn with_jwt_issuer_bad_credentials_returns_401_without_token() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+
+// ── Refresh token support ─────────────────────────────────────────────────────────────────────────
+
+const REFRESH_SECRET: &[u8] = b"refresh-e2e-test-secret";
+
+#[tokio::test]
+async fn with_jwt_issuer_refresh_enabled_returns_both_tokens_on_login() {
+    let store = InMemoryUserStore::new().with_user(
+        "diana",
+        Principal::new("user-diana-1").with_name("Diana"),
+        "secret123",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_jwt_issuer(JwtIssuer::hs256(REFRESH_SECRET).with_refresh_tokens());
+
+    let app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"diana","password":"secret123"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("access_token").and_then(|v| v.as_str()).is_some());
+    assert!(
+        json.get("refresh_token").and_then(|v| v.as_str()).is_some(),
+        "refresh_token must be present when .with_refresh_tokens() is set"
+    );
+}
+
+#[tokio::test]
+async fn refresh_endpoint_issues_new_token_pair_from_valid_refresh_token() {
+    // Step 1 – obtain a refresh token from the login endpoint.
+    let store = InMemoryUserStore::new().with_user(
+        "evan",
+        Principal::new("user-evan-1").with_name("Evan").with_role("member"),
+        "pass456",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_jwt_issuer(JwtIssuer::hs256(REFRESH_SECRET).with_refresh_tokens());
+
+    let login_app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let login_resp = login_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"evan","password":"pass456"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let login_body = to_bytes(login_resp.into_body(), usize::MAX).await.unwrap();
+    let login_json: serde_json::Value = serde_json::from_slice(&login_body).unwrap();
+    let refresh_token = login_json["refresh_token"].as_str().unwrap().to_string();
+
+    // Step 2 – use the refresh token to obtain a new token pair.
+    let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(REFRESH_SECRET))
+        .with_jwt_issuer(JwtIssuer::hs256(REFRESH_SECRET).with_refresh_tokens());
+
+    let refresh_app = Router::new()
+        .route(
+            "/token/refresh",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                refresh_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(refresh_auth);
+
+    let body_payload = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+    let refresh_resp = refresh_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/token/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(body_payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(refresh_resp.status(), StatusCode::OK);
+    let refresh_body = to_bytes(refresh_resp.into_body(), usize::MAX).await.unwrap();
+    let refresh_json: serde_json::Value = serde_json::from_slice(&refresh_body).unwrap();
+
+    let new_access = refresh_json["access_token"].as_str().expect("new access_token");
+    assert!(refresh_json.get("refresh_token").and_then(|v| v.as_str()).is_some());
+
+    // Step 3 – the new access token must be accepted by the protected API.
+    let api_auth = HarbourAuth::new(JwtStrategy::hs256(REFRESH_SECRET));
+    let api_app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let api_resp = api_app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("authorization", format!("Bearer {new_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let api_body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&api_body[..], b"user-evan-1:Evan");
+}
+
+#[tokio::test]
+async fn refresh_endpoint_rejects_access_token() {
+    let issuer = JwtIssuer::hs256(REFRESH_SECRET);
+    let access_token = issuer
+        .issue(&Principal::new("user-x"))
+        .unwrap();
+
+    let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(REFRESH_SECRET))
+        .with_jwt_issuer(JwtIssuer::hs256(REFRESH_SECRET).with_refresh_tokens());
+
+    let app = Router::new()
+        .route(
+            "/token/refresh",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                refresh_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(refresh_auth);
+
+    let body_payload = serde_json::json!({ "refresh_token": access_token }).to_string();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/token/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(body_payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn access_token_not_accepted_on_bearer_protected_route_when_refresh_token_is_used() {
+    // A refresh token must NOT be accepted by JwtStrategy on a regular API route.
+    let issuer = JwtIssuer::hs256(REFRESH_SECRET).with_refresh_tokens();
+    let refresh_token = issuer.issue_refresh(&Principal::new("user-y")).unwrap();
+
+    let api_auth = HarbourAuth::new(JwtStrategy::hs256(REFRESH_SECRET));
+    let app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("authorization", format!("Bearer {refresh_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

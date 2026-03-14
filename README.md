@@ -53,22 +53,49 @@ let store = InMemoryUserStore::new().with_user(
 );
 
 // Login route: verify credentials and respond with {"access_token": "..."}
-let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
     .with_jwt_issuer(JwtIssuer::hs256(secret));
 
 // Protected routes: verify the JWT on every request
-let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
 ```
 
 - **`POST /login`** — apply `require_auth` with `login_auth`. On success the response body contains `{"access_token": "..."}`.
 - **Protected routes** — apply `require_auth` with `api_auth`.
-- String strategy names (`"local"`, `"jwt"`) are fine for small/single-file setups. For larger codebases a type-safe enum is preferred — see the [JWT strategy section](#jwt-strategy) below.
 
 Tokens default to 1-hour expiry. Override when needed:
 
 ```rust
 JwtIssuer::hs256(secret).with_expiry(7 * 24 * 3600) // 7 days
 ```
+
+### Refresh tokens (opt-in)
+
+Add `.with_refresh_tokens()` to opt in. The login response body becomes
+`{"access_token": "...", "refresh_token": "..."}` automatically. The refresh token
+defaults to a 7-day lifetime; override with `.with_refresh_expiry(secs)`.
+
+Wire up a `/token/refresh` endpoint using `JwtRefreshStrategy` — it validates the
+refresh token from `{"refresh_token": "..."}` in the request body and, combined with
+`with_jwt_issuer`, issues a fresh token pair:
+
+```rust
+use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
+
+// Login: issues {"access_token": "...", "refresh_token": "..."}
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+
+// Refresh endpoint: POST /token/refresh {"refresh_token": "..."} → new token pair
+let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(secret))
+    .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+
+// Protected routes: unchanged — JwtStrategy automatically rejects refresh tokens
+let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+```
+
+`JwtStrategy` always rejects refresh tokens (tokens with `token_type = "refresh"`)
+so they can never be used to call protected API routes directly.
 
 ### RS256 variant (asymmetric key pair)
 
@@ -78,11 +105,11 @@ let private_pem = std::fs::read("private.pem")?;
 let public_pem  = std::fs::read("public.pem")?;
 
 // Login service: sign tokens with the private key.
-let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
     .with_jwt_issuer(JwtIssuer::rs256(&private_pem)?);
 
 // Any service: verify tokens with the public key.
-let api_auth = HarbourAuth::new("jwt", JwtStrategy::rs256(&public_pem)?);
+let api_auth = HarbourAuth::new(JwtStrategy::rs256(&public_pem)?);
 ```
 
 ---

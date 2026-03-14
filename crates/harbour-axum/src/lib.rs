@@ -158,8 +158,12 @@ impl HarbourAuth {
         self
     }
 
-    /// Issue a signed JWT (`{"access_token": "..."}`) in the response body after every
-    /// successful authentication.
+    /// Issue a signed JWT in the response body after every successful authentication.
+    ///
+    /// By default the response body is `{"access_token": "..."}`.
+    ///
+    /// When the issuer has refresh tokens enabled (via [`JwtIssuer::with_refresh_tokens`]),
+    /// the response body is `{"access_token": "...", "refresh_token": "..."}` instead.
     ///
     /// This is the recommended way to wire up a login endpoint: the [`JwtIssuer`] is stored
     /// inside `HarbourAuth` and invoked automatically — no manual `on_authenticated` hook needed.
@@ -169,31 +173,52 @@ impl HarbourAuth {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Login route: verify credentials, respond with {"access_token": "..."}
-    /// let login_auth = HarbourAuth::new("local", LocalStrategy::new(store, Argon2PasswordVerifier))
+    /// // HS256 — access token only (default):
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
     ///     .with_jwt_issuer(JwtIssuer::hs256(secret));
     ///
-    /// // Protected routes: verify the JWT on every request
-    /// let api_auth = HarbourAuth::new("jwt", JwtStrategy::hs256(secret));
+    /// // HS256 — access + refresh token (opt-in):
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Refresh endpoint: validate the refresh token and issue a new token pair.
+    /// let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(secret))
+    ///     .with_jwt_issuer(JwtIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Protected routes: verify the access token on every request.
+    /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
     /// ```
     #[cfg(feature = "jwt")]
     pub fn with_jwt_issuer(self, issuer: harbour_strategy_jwt::JwtIssuer) -> Self {
         let issuer = Arc::new(issuer);
         self.with_on_authenticated(move |principal, _response| {
-            match issuer.issue(principal) {
-                Ok(token) => {
-                    let body = serde_json::json!({"access_token": token}).to_string();
-                    // Response::builder() only fails for invalid header values. With a
-                    // hardcoded status and "application/json" content-type that is impossible
-                    // in practice, so the fallback to 500 is a belt-and-suspenders guard.
-                    axum::response::Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(axum::body::Body::from(body))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                }
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
+            let access_token = match issuer.issue(principal) {
+                Ok(t) => t,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+
+            let body = if issuer.has_refresh_tokens() {
+                let refresh_token = match issuer.issue_refresh(principal) {
+                    Ok(t) => t,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                serde_json::json!({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                })
+                .to_string()
+            } else {
+                serde_json::json!({"access_token": access_token}).to_string()
+            };
+
+            // Response::builder() only fails for invalid header values. With a
+            // hardcoded status and "application/json" content-type that is impossible
+            // in practice, so the fallback to 500 is a belt-and-suspenders guard.
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })
     }
 
@@ -294,6 +319,7 @@ pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
 /// - `Authorization: Bearer <token>` → `bearer_token`
 /// - JSON body fields `username_field` and `password_field` → `local.identifier` / `local.password`
 ///   (aligns with the PassportJS Local Strategy field naming convention)
+/// - JSON body field `refresh_token` → `refresh_token` (used by [`JwtRefreshStrategy`])
 pub fn context_from_request(
     headers: &HeaderMap,
     body: &[u8],
@@ -308,6 +334,9 @@ pub fn context_from_request(
         }
         if let Some(password) = json.get(password_field).and_then(|v| v.as_str()) {
             context = context.with_field("local.password", password);
+        }
+        if let Some(refresh_token) = json.get("refresh_token").and_then(|v| v.as_str()) {
+            context = context.with_field("refresh_token", refresh_token);
         }
         // If the body is not JSON, or the fields are missing/wrong type, the
         // local.identifier / local.password keys are simply absent from the context.
