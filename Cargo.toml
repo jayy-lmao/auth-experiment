@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "crates/harbour-core",
+  "crates/harbour-axum",
+  "crates/harbour-strategy-local",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = "0.7"
+http = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = "0.5"
