@@ -8,6 +8,7 @@ use axum::{
 };
 use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal};
 use harbour_core::{Principal, StaticBearerStrategy, StrategyName};
+use harbour_strategy_jwt::{JwtIssuer, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
 use tower::ServiceExt;
 
@@ -544,5 +545,109 @@ async fn default_field_names_still_work_without_override() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ── JWT strategy E2E tests ────────────────────────────────────────────────────────────────────────
+
+const JWT_SECRET: &[u8] = b"e2e-jwt-test-secret";
+
+#[tokio::test]
+async fn jwt_strategy_valid_token_returns_200_and_principal() {
+    let issuer = JwtIssuer::hs256(JWT_SECRET, 3600);
+    let strategy = JwtStrategy::hs256(JWT_SECRET);
+    let principal = Principal::new("jwt-user-1").with_name("JWT User");
+    let token = issuer.issue(&principal).unwrap();
+
+    let auth = HarbourAuth::new("jwt", strategy);
+    let app = Router::new()
+        .route("/protected", get(protected_handler))
+        .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
+        .with_state(auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"jwt-user-1:JWT User");
+}
+
+#[tokio::test]
+async fn jwt_strategy_invalid_token_returns_401() {
+    let strategy = JwtStrategy::hs256(JWT_SECRET);
+    let auth = HarbourAuth::new("jwt", strategy);
+    let app = Router::new()
+        .route("/protected", get(protected_handler))
+        .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
+        .with_state(auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header("authorization", "Bearer not.a.jwt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jwt_strategy_token_with_roles_principal_has_roles() {
+    let issuer = JwtIssuer::hs256(JWT_SECRET, 3600);
+    let strategy = JwtStrategy::hs256(JWT_SECRET);
+    let principal = Principal::new("jwt-admin-1")
+        .with_name("Admin")
+        .with_role("admin")
+        .with_role("editor");
+    let token = issuer.issue(&principal).unwrap();
+
+    let auth = HarbourAuth::new("jwt", strategy);
+
+    async fn roles_handler(AuthPrincipal(p): AuthPrincipal) -> impl IntoResponse {
+        format!(
+            "{}:{}",
+            p.id,
+            p.roles
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    let app = Router::new()
+        .route("/roles", get(roles_handler))
+        .layer(middleware::from_fn_with_state(auth.clone(), require_auth))
+        .with_state(auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/roles")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert!(body_str.starts_with("jwt-admin-1:"));
+    assert!(body_str.contains("admin"));
+    assert!(body_str.contains("editor"));
 }
 

@@ -4,9 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+## Enables `Argon2PasswordVerifier` and `Argon2PasswordHasher` for production password hashing.
+argon2 = ["dep:argon2", "dep:rand_core"]
+
 [dependencies]
 harbour-core = { path = "../harbour-core" }
 async-trait.workspace = true
+argon2 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

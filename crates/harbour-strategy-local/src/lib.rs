@@ -120,6 +120,63 @@ impl PasswordVerifier for PlaintextPasswordVerifier {
     }
 }
 
+/// Production-grade password verifier using the Argon2id algorithm.
+///
+/// Requires the `argon2` feature to be enabled.
+///
+/// ## Usage
+///
+/// ```rust,ignore
+/// use harbour_strategy_local::{Argon2PasswordVerifier, Argon2PasswordHasher};
+///
+/// // Hash a password at registration time:
+/// let hash = Argon2PasswordHasher::hash_password("hunter2").unwrap();
+///
+/// // Store `hash` in your database. Later, verify it:
+/// let verifier = Argon2PasswordVerifier;
+/// assert!(verifier.verify("hunter2", &hash).unwrap());
+/// ```
+#[cfg(feature = "argon2")]
+pub struct Argon2PasswordVerifier;
+
+#[cfg(feature = "argon2")]
+impl PasswordVerifier for Argon2PasswordVerifier {
+    fn verify(&self, password: &str, password_hash: &str) -> Result<bool, AuthError> {
+        use argon2::{Argon2, PasswordHash, PasswordVerifier as _};
+
+        let parsed_hash =
+            PasswordHash::new(password_hash).map_err(|_| AuthError::InvalidCredentials)?;
+
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok())
+    }
+}
+
+/// Helper for hashing passwords with Argon2id at user-registration time.
+///
+/// Requires the `argon2` feature to be enabled.
+#[cfg(feature = "argon2")]
+pub struct Argon2PasswordHasher;
+
+#[cfg(feature = "argon2")]
+impl Argon2PasswordHasher {
+    /// Hash `password` using Argon2id with a random salt.
+    ///
+    /// Store the returned PHC-format string in your user store.
+    /// Verify it later with [`Argon2PasswordVerifier`].
+    pub fn hash_password(password: &str) -> Result<String, AuthError> {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher as _};
+        use rand_core::OsRng;
+
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|_| AuthError::InvalidCredentials)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +238,47 @@ mod tests {
 
         let principal = auth.authenticate_with("local", &context).await.unwrap();
         assert_eq!(principal.id, "user-1");
+    }
+
+    #[cfg(feature = "argon2")]
+    #[tokio::test]
+    async fn argon2_verifier_accepts_correct_password() {
+        use crate::{Argon2PasswordHasher, Argon2PasswordVerifier};
+
+        let hash = Argon2PasswordHasher::hash_password("hunter2").unwrap();
+        let verifier = Argon2PasswordVerifier;
+        assert!(verifier.verify("hunter2", &hash).unwrap());
+    }
+
+    #[cfg(feature = "argon2")]
+    #[tokio::test]
+    async fn argon2_verifier_rejects_wrong_password() {
+        use crate::{Argon2PasswordHasher, Argon2PasswordVerifier};
+
+        let hash = Argon2PasswordHasher::hash_password("hunter2").unwrap();
+        let verifier = Argon2PasswordVerifier;
+        assert!(!verifier.verify("wrong_password", &hash).unwrap());
+    }
+
+    #[cfg(feature = "argon2")]
+    #[tokio::test]
+    async fn argon2_strategy_authenticates_valid_user() {
+        use crate::{Argon2PasswordHasher, Argon2PasswordVerifier};
+
+        let hash = Argon2PasswordHasher::hash_password("s3cur3pass").unwrap();
+        let store = InMemoryUserStore::new().with_user(
+            "bob",
+            Principal::new("user-2").with_name("Bob"),
+            hash,
+        );
+        let strategy = LocalStrategy::new(store, Argon2PasswordVerifier);
+
+        let auth = Authenticator::new().with_strategy("local", strategy);
+        let context = AuthContext::new()
+            .with_field(IDENTIFIER_KEY, "bob")
+            .with_field(PASSWORD_KEY, "s3cur3pass");
+
+        let principal = auth.authenticate_with("local", &context).await.unwrap();
+        assert_eq!(principal.id, "user-2");
     }
 }

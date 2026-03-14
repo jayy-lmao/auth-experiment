@@ -47,6 +47,8 @@ impl<T: StrategyName + ?Sized> StrategyName for &T {
 pub struct Principal {
     pub id: String,
     pub name: Option<String>,
+    /// Roles assigned to this principal, used for role-based access control (RBAC).
+    pub roles: Vec<String>,
 }
 
 impl Principal {
@@ -54,12 +56,32 @@ impl Principal {
         Self {
             id: id.into(),
             name: None,
+            roles: Vec::new(),
         }
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
+    }
+
+    /// Add a role to this principal.
+    ///
+    /// ```rust
+    /// use harbour_core::Principal;
+    ///
+    /// let p = Principal::new("user-1").with_role("admin").with_role("editor");
+    /// assert!(p.has_role("admin"));
+    /// assert!(!p.has_role("viewer"));
+    /// ```
+    pub fn with_role(mut self, role: impl Into<String>) -> Self {
+        self.roles.push(role.into());
+        self
+    }
+
+    /// Returns `true` if this principal has the given role.
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
     }
 }
 
@@ -193,6 +215,24 @@ impl Strategy for StaticBearerStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn principal_roles_can_be_assigned_and_checked() {
+        let p = Principal::new("user-1")
+            .with_name("Alice")
+            .with_role("admin")
+            .with_role("editor");
+        assert!(p.has_role("admin"));
+        assert!(p.has_role("editor"));
+        assert!(!p.has_role("viewer"));
+    }
+
+    #[test]
+    fn principal_has_empty_roles_by_default() {
+        let p = Principal::new("user-1");
+        assert!(p.roles.is_empty());
+        assert!(!p.has_role("admin"));
+    }
 
     #[tokio::test]
     async fn static_bearer_authenticates_with_matching_token() {
