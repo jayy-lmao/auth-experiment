@@ -44,6 +44,13 @@ pub struct HarbourAuth {
     unauthorized_responder: UnauthorizedResponder,
     on_authenticated: Option<OnAuthenticatedHook>,
     credential_fields: LocalCredentialConfig,
+    /// Name of the session cookie to extract from the `Cookie` request header.
+    ///
+    /// When `Some`, the named cookie is read and stored as `session_token` in the
+    /// [`AuthContext`] before authentication runs.  Set automatically by
+    /// [`with_session_cookie_issuer`][Self::with_session_cookie_issuer]; override manually
+    /// with [`with_session_cookie_name`][Self::with_session_cookie_name].
+    session_cookie_name: Option<String>,
 }
 
 impl Clone for HarbourAuth {
@@ -54,6 +61,7 @@ impl Clone for HarbourAuth {
             unauthorized_responder: Arc::clone(&self.unauthorized_responder),
             on_authenticated: self.on_authenticated.clone(),
             credential_fields: self.credential_fields.clone(),
+            session_cookie_name: self.session_cookie_name.clone(),
         }
     }
 }
@@ -81,6 +89,7 @@ impl HarbourAuth {
             unauthorized_responder: Arc::new(|| StatusCode::UNAUTHORIZED.into_response()),
             on_authenticated: None,
             credential_fields: LocalCredentialConfig::default(),
+            session_cookie_name: None,
         }
     }
 
@@ -222,6 +231,59 @@ impl HarbourAuth {
         })
     }
 
+    /// Issue a signed session cookie in the response after every successful authentication.
+    ///
+    /// The cookie value is a signed JWT, providing tamper-proof session data without
+    /// server-side session storage — analogous to .NET Identity Framework's cookie
+    /// authentication handler.
+    ///
+    /// On success the response handler's status and body are preserved; only a `Set-Cookie`
+    /// header is added.
+    ///
+    /// This method also configures the middleware to read the named session cookie from
+    /// incoming `Cookie` headers so that [`SessionCookieStrategy`] can authenticate subsequent
+    /// requests.  No additional configuration is required for the default cookie name
+    /// (`.harbour.session`).
+    ///
+    /// Enable the `session` feature on `harbour-axum` (on by default) to use this method.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use harbour_strategy_session::{SessionCookieIssuer, SessionCookieStrategy};
+    ///
+    /// let secret = b"my-session-secret";
+    ///
+    /// // Login endpoint: sets a session cookie on success.
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_session_cookie_issuer(SessionCookieIssuer::hs256(secret));
+    ///
+    /// // Protected routes: validates the session cookie on every request.
+    /// let api_auth = HarbourAuth::new(SessionCookieStrategy::hs256(secret));
+    /// ```
+    #[cfg(feature = "session")]
+    pub fn with_session_cookie_issuer(
+        self,
+        issuer: harbour_strategy_session::SessionCookieIssuer,
+    ) -> Self {
+        let cookie_name = issuer.cookie_name().to_string();
+        let issuer = Arc::new(issuer);
+        self.with_session_cookie_name(cookie_name)
+            .with_on_authenticated(move |principal, response| {
+                let cookie_value = match issuer.issue_set_cookie_header(principal) {
+                    Ok(v) => v,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                let header_value = match cookie_value.parse::<header::HeaderValue>() {
+                    Ok(v) => v,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                let mut response = response;
+                response.headers_mut().insert(header::SET_COOKIE, header_value);
+                response
+            })
+    }
+
     /// Override the JSON body field names used to extract credentials.
     ///
     /// Defaults to `username` / `password` (PassportJS Local Strategy convention).
@@ -235,6 +297,19 @@ impl HarbourAuth {
             username_field: username_field.into(),
             password_field: password_field.into(),
         };
+        self
+    }
+
+    /// Override the session cookie name extracted from incoming `Cookie` headers.
+    ///
+    /// Use this when the [`SessionCookieStrategy`] or [`SessionCookieIssuer`] have been
+    /// configured with a non-default cookie name via `.with_cookie_name(…)`.
+    ///
+    /// [`with_session_cookie_issuer`][Self::with_session_cookie_issuer] sets this automatically,
+    /// so you only need to call this method directly on routes that *validate* a non-default
+    /// session cookie.
+    pub fn with_session_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.session_cookie_name = Some(name.into());
         self
     }
 
@@ -276,6 +351,19 @@ impl HarbourAuth {
             (context_from_headers(&parts.headers), body)
         };
 
+        // Inject the session cookie into the context so that SessionCookieStrategy
+        // can authenticate requests that carry a session cookie.
+        let context = match &self.session_cookie_name {
+            Some(name) => {
+                if let Some(token) = extract_cookie_value(&parts.headers, name) {
+                    context.with_field("session_token", token)
+                } else {
+                    context
+                }
+            }
+            None => context,
+        };
+
         let name = strategy_name
             .as_ref()
             .map(|s| s.strategy_name().to_string())
@@ -295,6 +383,21 @@ impl HarbourAuth {
             Err(_) => (self.unauthorized_responder)(),
         }
     }
+}
+
+/// Extract the value of a named cookie from the `Cookie` request header.
+///
+/// Returns `None` if the `Cookie` header is absent or the named cookie is not found.
+fn extract_cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name.trim() == cookie_name).then(|| value.trim().to_string())
+            })
+        })
 }
 
 /// Build an [`AuthContext`] from request headers only (no body).

@@ -10,6 +10,7 @@ use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal}
 use harbour_core::{Principal, StaticBearerStrategy, StrategyName};
 use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
+use harbour_strategy_session::{SessionCookieIssuer, SessionCookieStrategy};
 use tower::ServiceExt;
 
 /// Application-defined strategy enum — used with `with_active_strategy` to select a
@@ -960,4 +961,321 @@ async fn access_token_not_accepted_on_bearer_protected_route_when_refresh_token_
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+
+// ── Session cookie support ────────────────────────────────────────────────────────────────────────
+
+const SESSION_SECRET: &[u8] = b"session-e2e-test-secret";
+
+/// Build the login app for session cookie tests.
+fn session_login_app() -> Router {
+    let store = InMemoryUserStore::new()
+        .with_user(
+            "grace",
+            Principal::new("session-user-grace").with_name("Grace"),
+            "grace-pass",
+        )
+        .with_user(
+            "henry",
+            Principal::new("session-user-henry").with_name("Henry").with_role("editor"),
+            "henry-pass",
+        );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_session_cookie_issuer(SessionCookieIssuer::hs256(SESSION_SECRET));
+
+    Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth)
+}
+
+/// Build the protected API app for session cookie tests.
+fn session_api_app() -> Router {
+    let api_auth = HarbourAuth::new(SessionCookieStrategy::hs256(SESSION_SECRET))
+        .with_session_cookie_name(".harbour.session");
+
+    Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth)
+}
+
+#[tokio::test]
+async fn session_login_sets_cookie_with_required_attributes() {
+    let response = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"grace-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie header must be present");
+
+    assert!(
+        set_cookie.starts_with(".harbour.session="),
+        "Cookie must use the default name: got {set_cookie}"
+    );
+    assert!(set_cookie.contains("HttpOnly"), "Cookie must be HttpOnly");
+    assert!(set_cookie.contains("Path=/"), "Cookie must have Path=/");
+    assert!(set_cookie.contains("SameSite=Lax"), "Cookie must have SameSite=Lax");
+}
+
+#[tokio::test]
+async fn session_cookie_authenticates_protected_route() {
+    // Step 1 — log in and obtain the session cookie.
+    let login_resp = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"grace-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie header must be present")
+        .to_string();
+
+    // Extract just the `name=value` part (everything before the first `;`).
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // Step 2 — use the cookie to access a protected route.
+    let api_resp = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-grace:Grace");
+}
+
+#[tokio::test]
+async fn session_cookie_preserves_roles_on_principal() {
+    // Log in as Henry who has the "editor" role.
+    let login_resp = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"henry","password":"henry-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // The protected handler echoes `id:name`; we verify the principal was decoded correctly.
+    let api_resp = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-henry:Henry");
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_without_cookie() {
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_with_tampered_cookie() {
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", ".harbour.session=tampered.invalid.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_with_wrong_secret() {
+    // Issue a valid cookie with the wrong secret.
+    let wrong_issuer = SessionCookieIssuer::hs256(b"wrong-secret");
+    let principal = Principal::new("attacker");
+    let set_cookie = wrong_issuer.issue_set_cookie_header(&principal).unwrap();
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_bad_credentials_return_401_without_cookie() {
+    let response = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers().get("set-cookie").is_none(),
+        "Set-Cookie must not be present on failed login"
+    );
+}
+
+#[tokio::test]
+async fn session_custom_cookie_name_works_end_to_end() {
+    const CUSTOM_NAME: &str = "my.auth.cookie";
+    let secret = b"custom-name-secret";
+
+    let store = InMemoryUserStore::new().with_user(
+        "iris",
+        Principal::new("session-user-iris").with_name("Iris"),
+        "iris-pass",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_session_cookie_issuer(
+            SessionCookieIssuer::hs256(secret).with_cookie_name(CUSTOM_NAME),
+        );
+
+    let login_app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    // Login — should set a cookie named CUSTOM_NAME.
+    let login_resp = login_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"iris","password":"iris-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie must be present")
+        .to_string();
+
+    assert!(
+        set_cookie.starts_with(&format!("{CUSTOM_NAME}=")),
+        "Cookie must use the custom name: got {set_cookie}"
+    );
+
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // Protected route configured for the custom cookie name.
+    let api_auth = HarbourAuth::new(
+        SessionCookieStrategy::hs256(secret).with_cookie_name(CUSTOM_NAME),
+    )
+    .with_session_cookie_name(CUSTOM_NAME);
+
+    let api_app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let api_resp = api_app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-iris:Iris");
 }
