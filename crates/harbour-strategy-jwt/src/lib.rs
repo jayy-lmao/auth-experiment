@@ -57,6 +57,34 @@ pub enum JwtError {
     RefreshNotEnabled,
 }
 
+/// Controls the `SameSite` attribute on JWT cookies issued by [`JwtCookieIssuer`].
+///
+/// See [MDN SameSite documentation](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite)
+/// for a description of each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// The browser only sends the cookie with same-site requests.
+    Strict,
+    /// The cookie is sent with same-site requests and with cross-site top-level navigations.
+    ///
+    /// This is the default — it provides good CSRF protection while allowing normal navigation.
+    Lax,
+    /// The cookie is sent with both same-site and cross-site requests.
+    ///
+    /// Requires `Secure` to be set; use for third-party cookie scenarios.
+    None,
+}
+
+impl std::fmt::Display for SameSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strict => write!(f, "Strict"),
+            Self::Lax => write!(f, "Lax"),
+            Self::None => write!(f, "None"),
+        }
+    }
+}
+
 /// A [`Strategy`] that authenticates requests by verifying a JWT Bearer token.
 ///
 /// The token must be present in the `Authorization: Bearer <token>` header;
@@ -388,6 +416,175 @@ impl Strategy for JwtRefreshStrategy {
         }
 
         Ok(token_data.claims.into())
+    }
+}
+
+/// Default cookie name for the access token issued by [`JwtCookieIssuer`].
+pub const DEFAULT_ACCESS_TOKEN_COOKIE_NAME: &str = "access_token";
+
+/// Default cookie name for the refresh token issued by [`JwtCookieIssuer`].
+pub const DEFAULT_REFRESH_TOKEN_COOKIE_NAME: &str = "refresh_token";
+
+/// Issues JWT access (and optionally refresh) tokens as `HttpOnly` cookies.
+///
+/// Similar to [`JwtIssuer`] but delivers tokens via `Set-Cookie` response headers rather than a
+/// JSON response body, protecting tokens from JavaScript access (XSS mitigation) while still
+/// allowing the full JWT access + refresh token workflow over cookies.
+///
+/// Use with [`HarbourAuth::with_jwt_cookie_issuer`] in the Axum adapter, which wires everything
+/// up automatically — including reading the cookies back on subsequent requests so that
+/// [`JwtStrategy`] and [`JwtRefreshStrategy`] can verify them.
+///
+/// ## Cookie attributes
+///
+/// - `HttpOnly` — always set; prevents JavaScript access.
+/// - `Path=/` — always set; cookie is valid for the entire site.
+/// - `SameSite` — configurable (default [`SameSite::Lax`]); provides CSRF protection.
+/// - `Secure` — configurable (default `false`); set `true` in production (HTTPS only).
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// use harbour_strategy_jwt::{JwtCookieIssuer, JwtStrategy};
+///
+/// let secret = b"my-secret";
+///
+/// // Login endpoint: issues access_token and refresh_token cookies on success.
+/// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+///     .with_jwt_cookie_issuer(JwtCookieIssuer::hs256(secret).with_refresh_tokens());
+///
+/// // Protected routes: JwtStrategy reads bearer_token which the middleware injects
+/// // automatically from the access_token cookie.
+/// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+/// ```
+pub struct JwtCookieIssuer {
+    inner: JwtIssuer,
+    access_cookie_name: String,
+    refresh_cookie_name: String,
+    secure: bool,
+    same_site: SameSite,
+}
+
+impl JwtCookieIssuer {
+    /// Create a JWT cookie issuer that signs tokens with HMAC-SHA-256.
+    pub fn hs256(secret: &[u8]) -> Self {
+        Self {
+            inner: JwtIssuer::hs256(secret),
+            access_cookie_name: DEFAULT_ACCESS_TOKEN_COOKIE_NAME.to_string(),
+            refresh_cookie_name: DEFAULT_REFRESH_TOKEN_COOKIE_NAME.to_string(),
+            secure: false,
+            same_site: SameSite::Lax,
+        }
+    }
+
+    /// Create a JWT cookie issuer that signs tokens with RSA-SHA-256.
+    ///
+    /// `private_key_pem` should be a PEM-encoded RSA private key.
+    pub fn rs256(private_key_pem: &[u8]) -> Result<Self, JwtError> {
+        Ok(Self {
+            inner: JwtIssuer::rs256(private_key_pem)?,
+            access_cookie_name: DEFAULT_ACCESS_TOKEN_COOKIE_NAME.to_string(),
+            refresh_cookie_name: DEFAULT_REFRESH_TOKEN_COOKIE_NAME.to_string(),
+            secure: false,
+            same_site: SameSite::Lax,
+        })
+    }
+
+    /// Override the cookie name used for the access token (default: `access_token`).
+    ///
+    /// Must match the name configured via [`HarbourAuth::with_access_token_cookie_name`]
+    /// on the routes that validate the token.
+    pub fn with_access_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.access_cookie_name = name.into();
+        self
+    }
+
+    /// Override the cookie name used for the refresh token (default: `refresh_token`).
+    ///
+    /// Must match the name configured via [`HarbourAuth::with_refresh_token_cookie_name`]
+    /// on the refresh endpoint.
+    pub fn with_refresh_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.refresh_cookie_name = name.into();
+        self
+    }
+
+    /// Set the `Secure` attribute on issued cookies.
+    ///
+    /// Enable this in production when serving over HTTPS.
+    pub fn with_secure(mut self, secure: bool) -> Self {
+        self.secure = secure;
+        self
+    }
+
+    /// Override the `SameSite` attribute (default: [`SameSite::Lax`]).
+    pub fn with_same_site(mut self, same_site: SameSite) -> Self {
+        self.same_site = same_site;
+        self
+    }
+
+    /// Override the access token lifetime in seconds (default: 3600 / 1 hour).
+    pub fn with_expiry(mut self, expiry_secs: u64) -> Self {
+        self.inner = self.inner.with_expiry(expiry_secs);
+        self
+    }
+
+    /// Enable refresh token cookie issuance with the default 7-day lifetime.
+    ///
+    /// When enabled, [`HarbourAuth::with_jwt_cookie_issuer`] sets both an `access_token`
+    /// and a `refresh_token` `Set-Cookie` header on every successful login.
+    pub fn with_refresh_tokens(mut self) -> Self {
+        self.inner = self.inner.with_refresh_tokens();
+        self
+    }
+
+    /// Override the refresh token lifetime in seconds.
+    ///
+    /// Implicitly enables refresh tokens (same as calling [`with_refresh_tokens`] first).
+    ///
+    /// [`with_refresh_tokens`]: JwtCookieIssuer::with_refresh_tokens
+    pub fn with_refresh_expiry(mut self, expiry_secs: u64) -> Self {
+        self.inner = self.inner.with_refresh_expiry(expiry_secs);
+        self
+    }
+
+    /// Returns `true` if refresh token cookie issuance is enabled on this issuer.
+    pub fn has_refresh_tokens(&self) -> bool {
+        self.inner.has_refresh_tokens()
+    }
+
+    /// Returns the access token cookie name.
+    pub fn access_cookie_name(&self) -> &str {
+        &self.access_cookie_name
+    }
+
+    /// Returns the refresh token cookie name.
+    pub fn refresh_cookie_name(&self) -> &str {
+        &self.refresh_cookie_name
+    }
+
+    fn build_cookie_header(&self, name: &str, value: &str) -> String {
+        let mut cookie = format!(
+            "{}={}; HttpOnly; Path=/; SameSite={}",
+            name, value, self.same_site
+        );
+        if self.secure {
+            cookie.push_str("; Secure");
+        }
+        cookie
+    }
+
+    /// Build a `Set-Cookie` header value for the access token.
+    pub fn issue_access_cookie_header(&self, principal: &Principal) -> Result<String, JwtError> {
+        let token = self.inner.issue(principal)?;
+        Ok(self.build_cookie_header(&self.access_cookie_name, &token))
+    }
+
+    /// Build a `Set-Cookie` header value for the refresh token.
+    ///
+    /// Returns [`JwtError::RefreshNotEnabled`] if refresh tokens have not been configured.
+    pub fn issue_refresh_cookie_header(&self, principal: &Principal) -> Result<String, JwtError> {
+        let token = self.inner.issue_refresh(principal)?;
+        Ok(self.build_cookie_header(&self.refresh_cookie_name, &token))
     }
 }
 

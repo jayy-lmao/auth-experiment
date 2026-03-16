@@ -51,6 +51,21 @@ pub struct HarbourAuth {
     /// [`with_session_cookie_issuer`][Self::with_session_cookie_issuer]; override manually
     /// with [`with_session_cookie_name`][Self::with_session_cookie_name].
     session_cookie_name: Option<String>,
+    /// Name of the access token cookie to extract and inject as `bearer_token`.
+    ///
+    /// When `Some`, the named cookie is read from `Cookie` headers and stored as `bearer_token`
+    /// in the [`AuthContext`] so that [`JwtStrategy`] can authenticate the request.
+    /// The `Authorization: Bearer …` header always takes precedence over the cookie.
+    /// Set automatically by [`with_jwt_cookie_issuer`][Self::with_jwt_cookie_issuer].
+    access_token_cookie_name: Option<String>,
+    /// Name of the refresh token cookie to extract and inject as `refresh_token`.
+    ///
+    /// When `Some`, the named cookie is read from `Cookie` headers and stored as `refresh_token`
+    /// in the [`AuthContext`] so that [`JwtRefreshStrategy`] can authenticate the request.
+    /// A `refresh_token` field in the JSON request body always takes precedence over the cookie.
+    /// Set automatically by [`with_jwt_cookie_issuer`][Self::with_jwt_cookie_issuer] when
+    /// refresh tokens are enabled.
+    refresh_token_cookie_name: Option<String>,
 }
 
 impl Clone for HarbourAuth {
@@ -62,6 +77,8 @@ impl Clone for HarbourAuth {
             on_authenticated: self.on_authenticated.clone(),
             credential_fields: self.credential_fields.clone(),
             session_cookie_name: self.session_cookie_name.clone(),
+            access_token_cookie_name: self.access_token_cookie_name.clone(),
+            refresh_token_cookie_name: self.refresh_token_cookie_name.clone(),
         }
     }
 }
@@ -90,6 +107,8 @@ impl HarbourAuth {
             on_authenticated: None,
             credential_fields: LocalCredentialConfig::default(),
             session_cookie_name: None,
+            access_token_cookie_name: None,
+            refresh_token_cookie_name: None,
         }
     }
 
@@ -284,6 +303,81 @@ impl HarbourAuth {
             })
     }
 
+    /// Issue JWT access (and optionally refresh) tokens as `HttpOnly` cookies after every
+    /// successful authentication.
+    ///
+    /// Unlike [`with_jwt_issuer`], which writes tokens to the JSON response body, this method
+    /// sets `Set-Cookie` response headers so that tokens are stored in browser cookies and are
+    /// never accessible from JavaScript (XSS mitigation).
+    ///
+    /// On success the handler's original status code and body are preserved; only `Set-Cookie`
+    /// headers are added.
+    ///
+    /// This method also configures the middleware to read the named access/refresh token cookies
+    /// from incoming `Cookie` headers so that [`JwtStrategy`] and [`JwtRefreshStrategy`] can
+    /// authenticate subsequent requests without any additional setup.
+    ///
+    /// Enable the `jwt` feature on `harbour-axum` (on by default) to use this method.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use harbour_strategy_jwt::{JwtCookieIssuer, JwtRefreshStrategy, JwtStrategy};
+    ///
+    /// let secret = b"my-secret";
+    ///
+    /// // Login: sets access_token (and refresh_token) cookies on success.
+    /// let login_auth = HarbourAuth::new(LocalStrategy::new(store, Argon2PasswordVerifier))
+    ///     .with_jwt_cookie_issuer(JwtCookieIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Refresh endpoint: reads refresh_token cookie, issues new cookie pair.
+    /// let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(secret))
+    ///     .with_jwt_cookie_issuer(JwtCookieIssuer::hs256(secret).with_refresh_tokens());
+    ///
+    /// // Protected routes: reads access_token cookie, validates with JwtStrategy.
+    /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
+    /// ```
+    #[cfg(feature = "jwt")]
+    pub fn with_jwt_cookie_issuer(
+        self,
+        issuer: harbour_strategy_jwt::JwtCookieIssuer,
+    ) -> Self {
+        let access_cookie_name = issuer.access_cookie_name().to_string();
+        let refresh_cookie_name = issuer.refresh_cookie_name().to_string();
+        let has_refresh = issuer.has_refresh_tokens();
+        let issuer = Arc::new(issuer);
+
+        let mut s = self.with_access_token_cookie_name(access_cookie_name);
+        if has_refresh {
+            s = s.with_refresh_token_cookie_name(refresh_cookie_name);
+        }
+        s.with_on_authenticated(move |principal, response| {
+            let access_cookie = match issuer.issue_access_cookie_header(principal) {
+                Ok(v) => v,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let access_header = match access_cookie.parse::<header::HeaderValue>() {
+                Ok(v) => v,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let mut response = response;
+            response.headers_mut().insert(header::SET_COOKIE, access_header);
+
+            if has_refresh {
+                let refresh_cookie = match issuer.issue_refresh_cookie_header(principal) {
+                    Ok(v) => v,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                let refresh_header = match refresh_cookie.parse::<header::HeaderValue>() {
+                    Ok(v) => v,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+                response.headers_mut().append(header::SET_COOKIE, refresh_header);
+            }
+            response
+        })
+    }
+
     /// Override the JSON body field names used to extract credentials.
     ///
     /// Defaults to `username` / `password` (PassportJS Local Strategy convention).
@@ -310,6 +404,33 @@ impl HarbourAuth {
     /// session cookie.
     pub fn with_session_cookie_name(mut self, name: impl Into<String>) -> Self {
         self.session_cookie_name = Some(name.into());
+        self
+    }
+
+    /// Configure the access token cookie name extracted from incoming `Cookie` headers.
+    ///
+    /// The named cookie's value is injected as `bearer_token` in the [`AuthContext`] so that
+    /// [`JwtStrategy`] can authenticate the request from the cookie.
+    ///
+    /// [`with_jwt_cookie_issuer`][Self::with_jwt_cookie_issuer] sets this automatically for the
+    /// login endpoint.  Use this method on *protected* routes when a non-default cookie name was
+    /// configured on the issuer via [`JwtCookieIssuer::with_access_cookie_name`].
+    pub fn with_access_token_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.access_token_cookie_name = Some(name.into());
+        self
+    }
+
+    /// Configure the refresh token cookie name extracted from incoming `Cookie` headers.
+    ///
+    /// The named cookie's value is injected as `refresh_token` in the [`AuthContext`] so that
+    /// [`JwtRefreshStrategy`] can authenticate the refresh request from the cookie.
+    ///
+    /// [`with_jwt_cookie_issuer`][Self::with_jwt_cookie_issuer] sets this automatically on the
+    /// login/refresh endpoint when refresh tokens are enabled.  Use this method on the *refresh*
+    /// route when a non-default cookie name was configured on the issuer via
+    /// [`JwtCookieIssuer::with_refresh_cookie_name`].
+    pub fn with_refresh_token_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.refresh_token_cookie_name = Some(name.into());
         self
     }
 
@@ -362,6 +483,34 @@ impl HarbourAuth {
                 }
             }
             None => context,
+        };
+
+        // Inject the access token cookie as `bearer_token` so that JwtStrategy can
+        // authenticate requests that carry the token in a cookie instead of an
+        // Authorization header.  The Authorization header takes precedence if present.
+        let context = match &self.access_token_cookie_name {
+            Some(name) if context.get("bearer_token").is_none() => {
+                if let Some(token) = extract_cookie_value(&parts.headers, name) {
+                    context.with_field("bearer_token", token)
+                } else {
+                    context
+                }
+            }
+            _ => context,
+        };
+
+        // Inject the refresh token cookie as `refresh_token` so that JwtRefreshStrategy
+        // can authenticate requests that carry the token in a cookie instead of a JSON body.
+        // A `refresh_token` field in the JSON body takes precedence if present.
+        let context = match &self.refresh_token_cookie_name {
+            Some(name) if context.get("refresh_token").is_none() => {
+                if let Some(token) = extract_cookie_value(&parts.headers, name) {
+                    context.with_field("refresh_token", token)
+                } else {
+                    context
+                }
+            }
+            _ => context,
         };
 
         let name = strategy_name
