@@ -10,6 +10,7 @@ use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal}
 use harbour_core::{Principal, StaticBearerStrategy, StrategyName};
 use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
+use harbour_strategy_session::{JwtCookieIssuer, SessionCookieIssuer, SessionCookieStrategy};
 use tower::ServiceExt;
 
 /// Application-defined strategy enum — used with `with_active_strategy` to select a
@@ -960,4 +961,702 @@ async fn access_token_not_accepted_on_bearer_protected_route_when_refresh_token_
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+
+// ── Session cookie support ────────────────────────────────────────────────────────────────────────
+
+const SESSION_SECRET: &[u8] = b"session-e2e-test-secret";
+
+/// Build the login app for session cookie tests.
+fn session_login_app() -> Router {
+    let store = InMemoryUserStore::new()
+        .with_user(
+            "grace",
+            Principal::new("session-user-grace").with_name("Grace"),
+            "grace-pass",
+        )
+        .with_user(
+            "henry",
+            Principal::new("session-user-henry").with_name("Henry").with_role("editor"),
+            "henry-pass",
+        );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_session_cookie_issuer(SessionCookieIssuer::hs256(SESSION_SECRET));
+
+    Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth)
+}
+
+/// Build the protected API app for session cookie tests.
+fn session_api_app() -> Router {
+    let api_auth = HarbourAuth::with_session_strategy(SessionCookieStrategy::hs256(SESSION_SECRET));
+
+    Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth)
+}
+
+#[tokio::test]
+async fn session_login_sets_cookie_with_required_attributes() {
+    let response = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"grace-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie header must be present");
+
+    assert!(
+        set_cookie.starts_with(".harbour.session="),
+        "Cookie must use the default name: got {set_cookie}"
+    );
+    assert!(set_cookie.contains("HttpOnly"), "Cookie must be HttpOnly");
+    assert!(set_cookie.contains("Path=/"), "Cookie must have Path=/");
+    assert!(set_cookie.contains("SameSite=Lax"), "Cookie must have SameSite=Lax");
+}
+
+#[tokio::test]
+async fn session_cookie_authenticates_protected_route() {
+    // Step 1 — log in and obtain the session cookie.
+    let login_resp = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"grace-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie header must be present")
+        .to_string();
+
+    // Extract just the `name=value` part (everything before the first `;`).
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // Step 2 — use the cookie to access a protected route.
+    let api_resp = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-grace:Grace");
+}
+
+#[tokio::test]
+async fn session_cookie_preserves_roles_on_principal() {
+    // Log in as Henry who has the "editor" role.
+    let login_resp = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"henry","password":"henry-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // The protected handler echoes `id:name`; we verify the principal was decoded correctly.
+    let api_resp = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-henry:Henry");
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_without_cookie() {
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_with_tampered_cookie() {
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", ".harbour.session=tampered.invalid.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_protected_route_returns_401_with_wrong_secret() {
+    // Issue a valid cookie with the wrong secret.
+    let wrong_issuer = SessionCookieIssuer::hs256(b"wrong-secret");
+    let principal = Principal::new("attacker");
+    let set_cookie = wrong_issuer.issue_set_cookie_header(&principal).unwrap();
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    let response = session_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_bad_credentials_return_401_without_cookie() {
+    let response = session_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"grace","password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers().get("set-cookie").is_none(),
+        "Set-Cookie must not be present on failed login"
+    );
+}
+
+#[tokio::test]
+async fn session_custom_cookie_name_works_end_to_end() {
+    const CUSTOM_NAME: &str = "my.auth.cookie";
+    let secret = b"custom-name-secret";
+
+    let store = InMemoryUserStore::new().with_user(
+        "iris",
+        Principal::new("session-user-iris").with_name("Iris"),
+        "iris-pass",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_session_cookie_issuer(
+            SessionCookieIssuer::hs256(secret).with_cookie_name(CUSTOM_NAME),
+        );
+
+    let login_app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    // Login — should set a cookie named CUSTOM_NAME.
+    let login_resp = login_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"iris","password":"iris-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("Set-Cookie must be present")
+        .to_string();
+
+    assert!(
+        set_cookie.starts_with(&format!("{CUSTOM_NAME}=")),
+        "Cookie must use the custom name: got {set_cookie}"
+    );
+
+    let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
+
+    // Protected route configured for the custom cookie name.
+    let api_auth = HarbourAuth::with_session_strategy(
+        SessionCookieStrategy::hs256(secret).with_cookie_name(CUSTOM_NAME),
+    );
+
+    let api_app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let api_resp = api_app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"session-user-iris:Iris");
+}
+
+
+// ── JWT bearer tokens via cookie ─────────────────────────────────────────────────────────────────
+
+const JWT_COOKIE_SECRET: &[u8] = b"jwt-cookie-e2e-test-secret";
+
+fn jwt_cookie_login_app() -> Router {
+    let store = InMemoryUserStore::new()
+        .with_user(
+            "jake",
+            Principal::new("jwt-cookie-user-jake").with_name("Jake"),
+            "jake-pass",
+        )
+        .with_user(
+            "kate",
+            Principal::new("jwt-cookie-user-kate").with_name("Kate").with_role("editor"),
+            "kate-pass",
+        );
+
+    let login_auth =
+        HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+            .with_jwt_cookie_issuer(JwtCookieIssuer::hs256(JWT_COOKIE_SECRET));
+
+    Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth)
+}
+
+fn jwt_cookie_api_app() -> Router {
+    let api_auth = HarbourAuth::new(JwtStrategy::hs256(JWT_COOKIE_SECRET))
+        .with_access_token_cookie_name("access_token");
+
+    Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth)
+}
+
+#[tokio::test]
+async fn jwt_cookie_login_sets_access_token_cookie() {
+    let response = jwt_cookie_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"jake","password":"jake-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+
+    let access_cookie = cookies
+        .iter()
+        .find(|c| c.starts_with("access_token="))
+        .expect("access_token cookie must be present");
+
+    assert!(access_cookie.contains("HttpOnly"), "access_token cookie must be HttpOnly");
+    assert!(access_cookie.contains("Path=/"), "access_token cookie must have Path=/");
+    assert!(access_cookie.contains("SameSite=Lax"), "access_token cookie must have SameSite=Lax");
+}
+
+#[tokio::test]
+async fn jwt_cookie_access_token_authenticates_protected_route() {
+    // Step 1 — log in and grab the access_token cookie.
+    let login_resp = jwt_cookie_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"jake","password":"jake-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(login_resp.status(), StatusCode::OK);
+
+    let access_cookie = login_resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("access_token="))
+        .map(|s| s.split(';').next().unwrap().trim().to_string())
+        .expect("access_token cookie must be present");
+
+    // Step 2 — use the cookie to access a protected route.
+    let api_resp = jwt_cookie_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &access_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"jwt-cookie-user-jake:Jake");
+}
+
+#[tokio::test]
+async fn jwt_cookie_protected_route_returns_401_without_cookie() {
+    let response = jwt_cookie_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jwt_cookie_protected_route_returns_401_with_tampered_cookie() {
+    let response = jwt_cookie_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", "access_token=tampered.invalid.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jwt_cookie_bad_credentials_return_401_without_cookie() {
+    let response = jwt_cookie_login_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"jake","password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let has_cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|v| v.to_str().map_or(false, |s| s.starts_with("access_token=")));
+
+    assert!(!has_cookie, "No access_token cookie should be set on failed login");
+}
+
+#[tokio::test]
+async fn jwt_cookie_with_refresh_tokens_sets_both_cookies() {
+    let store = InMemoryUserStore::new().with_user(
+        "leo",
+        Principal::new("jwt-cookie-user-leo").with_name("Leo"),
+        "leo-pass",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_jwt_cookie_issuer(
+            JwtCookieIssuer::hs256(JWT_COOKIE_SECRET).with_refresh_tokens(),
+        );
+
+    let app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"leo","password":"leo-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let cookies: Vec<String> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+
+    assert!(
+        cookies.iter().any(|c| c.starts_with("access_token=")),
+        "access_token cookie must be present"
+    );
+    assert!(
+        cookies.iter().any(|c| c.starts_with("refresh_token=")),
+        "refresh_token cookie must be present when .with_refresh_tokens() is set"
+    );
+}
+
+#[tokio::test]
+async fn jwt_cookie_refresh_endpoint_accepts_refresh_token_from_cookie() {
+    // Step 1 — log in and obtain both cookies.
+    let store = InMemoryUserStore::new().with_user(
+        "mia",
+        Principal::new("jwt-cookie-user-mia").with_name("Mia").with_role("member"),
+        "mia-pass",
+    );
+
+    let login_auth = HarbourAuth::new(LocalStrategy::new(store, PlaintextPasswordVerifier))
+        .with_jwt_cookie_issuer(
+            JwtCookieIssuer::hs256(JWT_COOKIE_SECRET).with_refresh_tokens(),
+        );
+
+    let login_app = Router::new()
+        .route(
+            "/login",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                login_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(login_auth);
+
+    let login_resp = login_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"mia","password":"mia-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let refresh_cookie = login_resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("refresh_token="))
+        .map(|s| s.split(';').next().unwrap().trim().to_string())
+        .expect("refresh_token cookie must be present");
+
+    // Step 2 — use the refresh_token cookie on the refresh endpoint.
+    let refresh_auth = HarbourAuth::new(JwtRefreshStrategy::hs256(JWT_COOKIE_SECRET))
+        .with_jwt_cookie_issuer(
+            JwtCookieIssuer::hs256(JWT_COOKIE_SECRET).with_refresh_tokens(),
+        );
+
+    let refresh_app = Router::new()
+        .route(
+            "/token/refresh",
+            post(local_handler).route_layer(middleware::from_fn_with_state(
+                refresh_auth.clone(),
+                require_auth,
+            )),
+        )
+        .with_state(refresh_auth);
+
+    let refresh_resp = refresh_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/token/refresh")
+                .header("cookie", &refresh_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(refresh_resp.status(), StatusCode::OK);
+
+    let new_cookies: Vec<String> = refresh_resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+
+    let new_access_kv = new_cookies
+        .iter()
+        .find(|c| c.starts_with("access_token="))
+        .map(|s| s.split(';').next().unwrap().trim().to_string())
+        .expect("new access_token cookie must be present");
+
+    assert!(
+        new_cookies.iter().any(|c| c.starts_with("refresh_token=")),
+        "new refresh_token cookie must be present"
+    );
+
+    // Step 3 — the new access_token cookie must be valid on a protected route.
+    let api_auth = HarbourAuth::new(JwtStrategy::hs256(JWT_COOKIE_SECRET))
+        .with_access_token_cookie_name("access_token");
+
+    let api_app = Router::new()
+        .route("/me", get(protected_handler))
+        .layer(middleware::from_fn_with_state(api_auth.clone(), require_auth))
+        .with_state(api_auth);
+
+    let api_resp = api_app
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &new_access_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&body[..], b"jwt-cookie-user-mia:Mia");
+}
+
+#[tokio::test]
+async fn authorization_header_takes_precedence_over_access_token_cookie() {
+    // A valid cookie for "jake" + a valid Bearer token for "kate".
+    // The Authorization header should win and "kate" should be identified.
+    let jake_issuer = JwtCookieIssuer::hs256(JWT_COOKIE_SECRET);
+    let jake_principal = Principal::new("jwt-cookie-user-jake").with_name("Jake");
+    let jake_cookie = jake_issuer
+        .issue_access_cookie_header(&jake_principal)
+        .unwrap();
+    let jake_cookie_kv = jake_cookie.split(';').next().unwrap().trim().to_string();
+
+    let kate_issuer = JwtIssuer::hs256(JWT_COOKIE_SECRET);
+    let kate_principal = Principal::new("jwt-cookie-user-kate").with_name("Kate");
+    let kate_token = kate_issuer.issue(&kate_principal).unwrap();
+
+    let api_resp = jwt_cookie_api_app()
+        .oneshot(
+            Request::builder()
+                .uri("/me")
+                .header("cookie", &jake_cookie_kv)
+                .header("authorization", format!("Bearer {kate_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let body = to_bytes(api_resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        &body[..],
+        b"jwt-cookie-user-kate:Kate",
+        "Authorization header must take precedence over cookie"
+    );
 }

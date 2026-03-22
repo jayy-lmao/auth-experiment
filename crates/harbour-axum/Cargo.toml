@@ -7,12 +7,16 @@ license.workspace = true
 [features]
 ## Enables `HarbourAuth::with_jwt_issuer` for automatic JWT issuance after login.
 ## On by default; disable with `default-features = false` for a leaner build.
-default = ["jwt"]
+default = ["jwt", "session"]
 jwt = ["dep:harbour-strategy-jwt"]
+## Enables `HarbourAuth::with_session_cookie_issuer` for cookie-based session authentication.
+## On by default; disable with `default-features = false` for a leaner build.
+session = ["dep:harbour-strategy-session"]
 
 [dependencies]
 harbour-core = { path = "../harbour-core" }
 harbour-strategy-jwt = { path = "../harbour-strategy-jwt", optional = true }
+harbour-strategy-session = { path = "../harbour-strategy-session", optional = true }
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
@@ -22,4 +26,5 @@ tower.workspace = true
 [dev-dependencies]
 harbour-strategy-local = { path = "../harbour-strategy-local" }
 harbour-strategy-jwt = { path = "../harbour-strategy-jwt" }
+harbour-strategy-session = { path = "../harbour-strategy-session" }
 tokio.workspace = true

@@ -4,6 +4,7 @@ members = [
   "crates/harbour-axum",
   "crates/harbour-strategy-local",
   "crates/harbour-strategy-jwt",
+  "crates/harbour-strategy-session",
 ]
 resolver = "2"
 

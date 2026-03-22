@@ -401,6 +401,7 @@ dependencies = [
  "harbour-core",
  "harbour-strategy-jwt",
  "harbour-strategy-local",
+ "harbour-strategy-session",
  "http",
  "serde_json",
  "tokio",
@@ -437,6 +438,16 @@ dependencies = [
  "async-trait",
  "harbour-core",
  "rand_core",
+ "tokio",
+]
+
+[[package]]
+name = "harbour-strategy-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "harbour-core",
+ "harbour-strategy-jwt",
  "tokio",
 ]
 
