@@ -317,12 +317,13 @@ impl HarbourAuth {
     /// from incoming `Cookie` headers so that [`JwtStrategy`] and [`JwtRefreshStrategy`] can
     /// authenticate subsequent requests without any additional setup.
     ///
-    /// Enable the `jwt` feature on `harbour-axum` (on by default) to use this method.
+    /// Enable the `session` feature on `harbour-axum` (on by default) to use this method.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use harbour_strategy_jwt::{JwtCookieIssuer, JwtRefreshStrategy, JwtStrategy};
+    /// use harbour_strategy_session::JwtCookieIssuer;
+    /// use harbour_strategy_jwt::{JwtRefreshStrategy, JwtStrategy};
     ///
     /// let secret = b"my-secret";
     ///
@@ -337,10 +338,10 @@ impl HarbourAuth {
     /// // Protected routes: reads access_token cookie, validates with JwtStrategy.
     /// let api_auth = HarbourAuth::new(JwtStrategy::hs256(secret));
     /// ```
-    #[cfg(feature = "jwt")]
+    #[cfg(feature = "session")]
     pub fn with_jwt_cookie_issuer(
         self,
-        issuer: harbour_strategy_jwt::JwtCookieIssuer,
+        issuer: harbour_strategy_session::JwtCookieIssuer,
     ) -> Self {
         let access_cookie_name = issuer.access_cookie_name().to_string();
         let refresh_cookie_name = issuer.refresh_cookie_name().to_string();
@@ -396,15 +397,47 @@ impl HarbourAuth {
 
     /// Override the session cookie name extracted from incoming `Cookie` headers.
     ///
-    /// Use this when the [`SessionCookieStrategy`] or [`SessionCookieIssuer`] have been
-    /// configured with a non-default cookie name via `.with_cookie_name(…)`.
+    /// For the common case, prefer [`with_session_strategy`][Self::with_session_strategy],
+    /// which creates a `HarbourAuth` from a `SessionCookieStrategy` and auto-reads the
+    /// cookie name in a single call.
     ///
-    /// [`with_session_cookie_issuer`][Self::with_session_cookie_issuer] sets this automatically,
-    /// so you only need to call this method directly on routes that *validate* a non-default
-    /// session cookie.
+    /// Use this method directly only in advanced scenarios where you need to set the
+    /// cookie name independently of the strategy — for example when chaining additional
+    /// strategies onto an existing `HarbourAuth`, or when the cookie name is determined
+    /// at runtime rather than at construction time.
     pub fn with_session_cookie_name(mut self, name: impl Into<String>) -> Self {
         self.session_cookie_name = Some(name.into());
         self
+    }
+
+    /// Create a `HarbourAuth` from a [`SessionCookieStrategy`], automatically reading the
+    /// cookie name from the strategy.
+    ///
+    /// This is the ergonomic alternative to
+    /// `HarbourAuth::new(strategy).with_session_cookie_name(strategy.cookie_name())`,
+    /// eliminating the need to repeat the cookie name manually.
+    ///
+    /// Enable the `session` feature on `harbour-axum` (on by default) to use this method.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use harbour_strategy_session::SessionCookieStrategy;
+    ///
+    /// // Default cookie name (.harbour.session) — no extra configuration needed.
+    /// let api_auth = HarbourAuth::with_session_strategy(SessionCookieStrategy::hs256(secret));
+    ///
+    /// // Custom cookie name — still just one call.
+    /// let api_auth = HarbourAuth::with_session_strategy(
+    ///     SessionCookieStrategy::hs256(secret).with_cookie_name("app.session"),
+    /// );
+    /// ```
+    #[cfg(feature = "session")]
+    pub fn with_session_strategy(
+        strategy: harbour_strategy_session::SessionCookieStrategy,
+    ) -> Self {
+        let cookie_name = strategy.cookie_name().to_string();
+        Self::new(strategy).with_session_cookie_name(cookie_name)
     }
 
     /// Configure the access token cookie name extracted from incoming `Cookie` headers.
@@ -552,7 +585,7 @@ fn extract_cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String
 /// Build an [`AuthContext`] from request headers only (no body).
 ///
 /// - `Authorization: Bearer <token>` → `bearer_token`
-pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
+pub(crate) fn context_from_headers(headers: &HeaderMap) -> AuthContext {
     let mut context = AuthContext::new();
 
     if let Some(token) = headers
@@ -572,7 +605,7 @@ pub fn context_from_headers(headers: &HeaderMap) -> AuthContext {
 /// - JSON body fields `username_field` and `password_field` → `local.identifier` / `local.password`
 ///   (aligns with the PassportJS Local Strategy field naming convention)
 /// - JSON body field `refresh_token` → `refresh_token` (used by [`JwtRefreshStrategy`])
-pub fn context_from_request(
+pub(crate) fn context_from_request(
     headers: &HeaderMap,
     body: &[u8],
     username_field: &str,

@@ -8,9 +8,9 @@ use axum::{
 };
 use harbour_axum::{require_auth, AuthPrincipal, HarbourAuth, MaybeAuthPrincipal};
 use harbour_core::{Principal, StaticBearerStrategy, StrategyName};
-use harbour_strategy_jwt::{JwtCookieIssuer, JwtIssuer, JwtRefreshStrategy, JwtStrategy};
+use harbour_strategy_jwt::{JwtIssuer, JwtRefreshStrategy, JwtStrategy};
 use harbour_strategy_local::{InMemoryUserStore, LocalStrategy, PlaintextPasswordVerifier};
-use harbour_strategy_session::{SessionCookieIssuer, SessionCookieStrategy};
+use harbour_strategy_session::{JwtCookieIssuer, SessionCookieIssuer, SessionCookieStrategy};
 use tower::ServiceExt;
 
 /// Application-defined strategy enum — used with `with_active_strategy` to select a
@@ -998,8 +998,7 @@ fn session_login_app() -> Router {
 
 /// Build the protected API app for session cookie tests.
 fn session_api_app() -> Router {
-    let api_auth = HarbourAuth::new(SessionCookieStrategy::hs256(SESSION_SECRET))
-        .with_session_cookie_name(".harbour.session");
+    let api_auth = HarbourAuth::with_session_strategy(SessionCookieStrategy::hs256(SESSION_SECRET));
 
     Router::new()
         .route("/me", get(protected_handler))
@@ -1254,10 +1253,9 @@ async fn session_custom_cookie_name_works_end_to_end() {
     let cookie_kv = set_cookie.split(';').next().unwrap().trim().to_string();
 
     // Protected route configured for the custom cookie name.
-    let api_auth = HarbourAuth::new(
+    let api_auth = HarbourAuth::with_session_strategy(
         SessionCookieStrategy::hs256(secret).with_cookie_name(CUSTOM_NAME),
-    )
-    .with_session_cookie_name(CUSTOM_NAME);
+    );
 
     let api_app = Router::new()
         .route("/me", get(protected_handler))
